@@ -1,0 +1,67 @@
+/* Theme-aware styling: relies on Streamlit's CSS variables so it works in light and dark mode. */
+
+.block-container {
+    padding-top: 2rem;
+    max-width: 1200px;
+}
+
+.app-header h1 {
+    margin: 0;
+    font-size: 1.9rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+}
+
+.app-header p {
+    margin: 0.25rem 0 0 0;
+    opacity: 0.65;
+}
+
+/* Bordered containers (team cards, KPI tiles) */
+div[data-testid="stVerticalBlockBorderWrapper"] {
+    border-radius: 12px;
+}
+
+.team-card-name {
+    font-weight: 600;
+    font-size: 1.05rem;
+    line-height: 1.25;
+    margin-bottom: 0.15rem;
+}
+
+.team-card-record {
+    font-size: 1.6rem;
+    font-weight: 700;
+    line-height: 1.2;
+}
+
+.team-card-meta {
+    font-size: 0.85rem;
+    opacity: 0.65;
+}
+
+.rank-badge {
+    display: inline-block;
+    padding: 0.05rem 0.5rem;
+    border-radius: 999px;
+    font-size: 0.75rem;
+    font-weight: 600;
+    background: rgba(79, 70, 229, 0.14);
+    color: #4f46e5;
+    margin-right: 0.4rem;
+}
+
+.rec-good { color: #16a34a; }
+.rec-mid  { color: #d97706; }
+.rec-bad  { color: #dc2626; }
+.rec-none { opacity: 0.5; }
+
+.stat-box {
+    border: 1px solid rgba(128, 128, 128, 0.3);
+    border-radius: 12px;
+    padding: 0.9rem 1.1rem;
+    margin-bottom: 0.75rem;
+}
+
+.stat-box h4 { margin: 0 0 0.25rem 0; }
+.stat-box p  { margin: 0.1rem 0; }
