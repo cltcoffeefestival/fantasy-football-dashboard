@@ -66,6 +66,20 @@ def format_players(players):
     return " + ".join(parts)
 
 
+def render_trade(t):
+    """One trade card"""
+    with st.container(border=True):
+        st.markdown(f"{TIER_ICONS[t.tier]} **{t.tier}**")
+        st.markdown(f"You give: {format_players(t.give)}")
+        st.markdown(f"You get: {format_players(t.get)}")
+        m1, m2 = st.columns(2)
+        m1.metric("Your lineup", f"+{t.my_gain:.1f} pts/wk")
+        m2.metric(f"{t.partner_name} lineup", f"{t.their_gain:+.1f} pts/wk")
+        st.caption(f"Trade value: you give {t.give_value:.0f} · you get {t.get_value:.0f}")
+        for note in t.notes:
+            st.caption(f"⚠️ {note}")
+
+
 def record_class(wins, losses):
     """CSS class for a record based on win percentage"""
     total = wins + losses
@@ -352,22 +366,34 @@ def main():
 
             st.subheader("Recommended trades")
             trades = find_trades(
-                snapshot, team_id, min_gain=min_gain, max_results=25 if creative else 15,
+                snapshot, team_id, min_gain=min_gain,
                 per_partner=4 if creative else 3, creative=creative, focus_positions=focus,
             )
+
+            # Group by trade partner so every team shows up, best-fitting partners first
+            by_partner = {}
+            for t in trades:
+                by_partner.setdefault(t.partner_id, []).append(t)
+            others = [tm for tid, tm in snapshot.teams.items() if tid != team_id]
+            no_match = [tm.name for tm in others if tm.team_id not in by_partner]
+
             if not trades:
                 st.info("No trades clear the bar right now. Try lowering the minimum gain or looking further ahead.")
-            for t in trades:
-                with st.container(border=True):
-                    st.markdown(f"**Trade with {t.partner_name}** · {TIER_ICONS[t.tier]} {t.tier}")
-                    st.markdown(f"You give: {format_players(t.give)}")
-                    st.markdown(f"You get: {format_players(t.get)}")
-                    m1, m2 = st.columns(2)
-                    m1.metric("Your lineup", f"+{t.my_gain:.1f} pts/wk")
-                    m2.metric(f"{t.partner_name} lineup", f"{t.their_gain:+.1f} pts/wk")
-                    st.caption(f"Trade value: you give {t.give_value:.0f} · you get {t.get_value:.0f}")
-                    for note in t.notes:
-                        st.caption(f"⚠️ {note}")
+
+            for rank, (pid, plist) in enumerate(by_partner.items()):
+                partner = snapshot.teams[pid]
+                best = plist[0]
+                title = (
+                    f"{partner.name} ({partner.record}) · {len(plist)} trade{'s' if len(plist) != 1 else ''} · "
+                    f"best: {TIER_ICONS[best.tier]} {best.tier}"
+                )
+                with st.expander(title, expanded=rank < 3):
+                    for t in plist:
+                        render_trade(t)
+
+            if no_match:
+                st.caption("No fit found with: " + ", ".join(no_match))
+
 
     # Page: Team Analysis
     elif page == "🤝 Team Analysis":

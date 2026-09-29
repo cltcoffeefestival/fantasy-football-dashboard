@@ -55,6 +55,8 @@ TRADE_INJURY_DISCOUNT = {"DOUBTFUL": 0.95, "OUT": 0.7, "SUSPENSION": 0.8, "INJUR
 # Creative mode loosens the partner-side filters so longer shots and bigger packages show up
 CREATIVE_MIN_THEIR_GAIN = -1.5
 CREATIVE_MIN_VALUE_RATIO = 0.4
+FALLBACK_MIN_THEIR_GAIN = -3.0
+FALLBACK_MIN_VALUE_RATIO = 0.3
 CREATIVE_COMBOS = [(2, 2), (3, 1), (1, 3)]
 POOL_SIZE = 8            # top players per side considered in a swap
 STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
@@ -83,6 +85,7 @@ class TeamSnapshot:
     team_id: int
     name: str
     players: List[PlayerValue]
+    record: str = ""
 
 
 TIER_ORDER = ["Win-win", "Worth a shot", "Long shot"]
@@ -318,7 +321,7 @@ def find_trades(
     snapshot: LeagueSnapshot,
     my_team_id: int,
     min_gain: float = MIN_MY_GAIN,
-    max_results: int = 15,
+    max_results: Optional[int] = None,
     per_partner: int = 3,
     creative: bool = False,
     focus_positions: Optional[List[str]] = None,
@@ -351,9 +354,7 @@ def find_trades(
     my_before = lineup_total(me.players, slots, n)
     proposals: List[TradeProposal] = []
 
-    for tid, other in snapshot.teams.items():
-        if tid == my_team_id:
-            continue
+    def search_partner(tid, other, min_gain, min_their, min_ratio) -> List[TradeProposal]:
         their_pool = useful(other.players)
         their_before = lineup_total(other.players, slots, n)
         their_cheapest = by_value(other.players)
@@ -423,20 +424,36 @@ def find_trades(
         found.sort(key=lambda t: t.rank_key)
         # keep the best few per partner, without repeating the same player on either side
         used_give, used_get = set(), set()
+        kept_trades: List[TradeProposal] = []
         kept = 0
         for t in found:
             gids, rids = {id(p) for p in t.give}, {id(p) for p in t.get}
             if gids & used_give or rids & used_get:
                 continue
-            proposals.append(t)
+            kept_trades.append(t)
             used_give |= gids
             used_get |= rids
             kept += 1
             if kept >= per_partner:
                 break
+        return kept_trades
+
+    # Every team gets a look. In creative mode a team with no fit under the normal bar is
+    # retried with a much lower bar, so you always see the best available angle with each team.
+    attempts = [(min_gain, min_their, min_ratio)]
+    if creative:
+        attempts.append((min(min_gain, 0.25), FALLBACK_MIN_THEIR_GAIN, FALLBACK_MIN_VALUE_RATIO))
+    for tid, other in snapshot.teams.items():
+        if tid == my_team_id:
+            continue
+        for gain_bar, their_bar, ratio_bar in attempts:
+            kept_trades = search_partner(tid, other, gain_bar, their_bar, ratio_bar)
+            if kept_trades:
+                proposals.extend(kept_trades)
+                break
 
     proposals.sort(key=lambda t: t.rank_key)
-    return proposals[:max_results]
+    return proposals[:max_results] if max_results else proposals
 
 
 # ------------------------------------------------------------ ESPN integration
@@ -475,6 +492,7 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
             team_id=team.team_id,
             name=team.team_name,
             players=[build_player_value(p, weeks, ratings) for p in team.roster],
+            record=f"{team.wins}-{team.losses}",
         )
 
     return LeagueSnapshot(
