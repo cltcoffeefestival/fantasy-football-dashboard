@@ -1,0 +1,378 @@
+"""
+Trade Finder - finds trades that improve your lineup and are plausible for the other team.
+
+How it works
+1. Each player gets a weekly value for the next N weeks:
+   blend of season average and projection, x opponent matchup, x injury availability,
+   and 0 on bye weeks.
+2. Each team's best lineup is built from the league's real lineup slots (incl. flex).
+3. Candidate 1-for-1, 2-for-1 and 1-for-2 swaps with every other team are scored by
+   how much they change BOTH teams' lineup totals. A trade is only suggested when it
+   helps you meaningfully, helps them at least a little, and is roughly even in raw value.
+"""
+from dataclasses import dataclass, field
+from itertools import combinations
+from typing import Dict, List, Optional, Tuple
+import logging
+
+logger = logging.getLogger(__name__)
+
+WEEKS_AHEAD = 4
+
+# Slot label -> player positions that may fill it
+FLEX_ELIGIBILITY = {
+    "RB/WR": {"RB", "WR"},
+    "WR/TE": {"WR", "TE"},
+    "RB/WR/TE": {"RB", "WR", "TE"},
+    "OP": {"QB", "RB", "WR", "TE"},
+}
+NON_LINEUP_SLOTS = {"BE", "IR", "ER", "TQB", ""}
+
+# Probability a player is available in each upcoming week, by ESPN injury status.
+# Indexed by weeks from now; beyond the list the player is treated as healthy.
+INJURY_AVAILABILITY = {
+    "QUESTIONABLE": [0.9],
+    "DOUBTFUL": [0.4, 0.8],
+    "OUT": [0.0, 0.3, 0.6, 0.85],
+    "INJURY_RESERVE": [0.0, 0.0, 0.2, 0.4, 0.6, 0.8],
+    "SUSPENSION": [0.0, 0.4, 0.8],
+}
+
+# Matchup: ESPN gives each opponent a rank vs. a position (1..32). We assume 1 is the
+# toughest defense and 32 the easiest, and swing a player's value by +/- this fraction.
+MATCHUP_SWING = 0.12
+MATCHUP_POSITIONS = {"QB": "1", "RB": "2", "WR": "3", "TE": "4"}  # ESPN defaultPositionId
+
+# Trade filters
+MIN_MY_GAIN = 1.0        # pts/week
+MIN_THEIR_GAIN = 0.25    # pts/week: otherwise they have no reason to accept
+MIN_VALUE_RATIO = 0.7    # raw value given vs. received must be within 30%
+POOL_SIZE = 8            # top players per side considered in a swap
+STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
+
+
+@dataclass
+class PlayerValue:
+    name: str
+    position: str
+    pro_team: str
+    injury: str
+    base: float                # blended points per game
+    weekly: List[float] = field(default_factory=list)
+
+    @property
+    def avg(self) -> float:
+        return sum(self.weekly) / len(self.weekly) if self.weekly else 0.0
+
+    @property
+    def injured(self) -> bool:
+        return self.injury not in ("", "ACTIVE", "NORMAL", "NONE")
+
+
+@dataclass
+class TeamSnapshot:
+    team_id: int
+    name: str
+    players: List[PlayerValue]
+
+
+@dataclass
+class TradeProposal:
+    partner_id: int
+    partner_name: str
+    give: List[PlayerValue]
+    get: List[PlayerValue]
+    my_gain: float
+    their_gain: float
+    notes: List[str]
+
+    @property
+    def score(self) -> float:
+        return self.my_gain + 0.5 * self.their_gain
+
+
+@dataclass
+class LeagueSnapshot:
+    teams: Dict[int, TeamSnapshot]
+    slots: List[Tuple[str, frozenset]]
+    weeks: List[int]
+    schedule_adjusted: bool
+
+
+# ---------------------------------------------------------------- player values
+
+def base_points(avg_points: float, projected_avg: float, total_points: float) -> float:
+    """Blend actual and projected per-game scoring; trust actuals more as games pile up"""
+    avg, proj = avg_points or 0.0, projected_avg or 0.0
+    if avg <= 0 and proj <= 0:
+        return 0.0
+    if proj <= 0:
+        return avg
+    if avg <= 0:
+        return proj
+    games = (total_points or 0.0) / avg
+    weight = min(games, 8) / 8 * 0.6
+    return weight * avg + (1 - weight) * proj
+
+
+def availability(injury: str, week_index: int) -> float:
+    curve = INJURY_AVAILABILITY.get((injury or "").upper(), [])
+    return curve[week_index] if week_index < len(curve) else 1.0
+
+
+def matchup_factor(rank: Optional[int]) -> float:
+    if not rank:
+        return 1.0
+    return 1 + MATCHUP_SWING * ((rank - 16.5) / 15.5)
+
+
+def build_player_value(player, weeks: List[int], ratings: Dict[int, Dict[str, Dict[str, int]]]) -> PlayerValue:
+    """Turn an espn_api Player into a PlayerValue over the given weeks"""
+    injury = (getattr(player, "injuryStatus", "") or "ACTIVE").upper()
+    position = getattr(player, "position", "")
+    base = base_points(
+        getattr(player, "avg_points", 0),
+        getattr(player, "projected_avg_points", 0),
+        getattr(player, "total_points", 0),
+    )
+    schedule = getattr(player, "schedule", None) or {}
+    stats = getattr(player, "stats", None) or {}
+
+    weekly = []
+    for i, week in enumerate(weeks):
+        game = schedule.get(str(week)) or schedule.get(week)
+        if schedule and not game:
+            weekly.append(0.0)  # bye week
+            continue
+        value = (stats.get(week) or {}).get("projected_points") or base
+        if game:
+            opp = game.get("team") if isinstance(game, dict) else None
+            rank = ratings.get(week, {}).get(position, {}).get(opp)
+            value *= matchup_factor(rank)
+        weekly.append(value * availability(injury, i))
+
+    return PlayerValue(
+        name=player.name,
+        position=position,
+        pro_team=str(getattr(player, "proTeam", "") or ""),
+        injury=injury,
+        base=base,
+        weekly=weekly,
+    )
+
+
+# -------------------------------------------------------------------- lineups
+
+def build_slots(position_slot_counts: Dict[str, int]) -> List[Tuple[str, frozenset]]:
+    """Expand slot counts into a list of (label, eligible positions), most restrictive first"""
+    slots = []
+    for label, count in position_slot_counts.items():
+        if label in NON_LINEUP_SLOTS or not count:
+            continue
+        eligible = frozenset(FLEX_ELIGIBILITY.get(label, {label}))
+        slots.extend([(label, eligible)] * int(count))
+    slots.sort(key=lambda s: len(s[1]))
+    return slots
+
+
+def lineup_total(players: List[PlayerValue], slots, n_weeks: int) -> float:
+    """Sum of the best possible lineup for each upcoming week"""
+    total = 0.0
+    for w in range(n_weeks):
+        ranked = sorted(players, key=lambda p: p.weekly[w], reverse=True)
+        used = set()
+        for _, eligible in slots:
+            for idx, p in enumerate(ranked):
+                if idx not in used and p.position in eligible:
+                    used.add(idx)
+                    total += p.weekly[w]
+                    break
+    return total
+
+
+def position_strengths(teams: Dict[int, TeamSnapshot], slots) -> Dict[int, Dict[str, float]]:
+    """Avg weekly value of each team's starters at each position (dedicated slots only)"""
+    counts: Dict[str, int] = {}
+    for label, eligible in slots:
+        if len(eligible) == 1:
+            counts[label] = counts.get(label, 0) + 1
+    result = {}
+    for tid, team in teams.items():
+        result[tid] = {}
+        for pos, k in counts.items():
+            top = sorted((p.avg for p in team.players if p.position == pos), reverse=True)[:k]
+            top += [0.0] * (k - len(top))
+            result[tid][pos] = sum(top)
+    return result
+
+
+def needs_table(teams: Dict[int, TeamSnapshot], slots, team_id: int) -> List[Dict]:
+    """Per-position strength of one team vs. the league average"""
+    strengths = position_strengths(teams, slots)
+    rows = []
+    for pos in strengths[team_id]:
+        league_avg = sum(s[pos] for s in strengths.values()) / len(strengths)
+        mine = strengths[team_id][pos]
+        diff = (mine - league_avg) / league_avg if league_avg else 0.0
+        label = "Strength" if diff >= STRENGTH_MARGIN else "Weakness" if diff <= -STRENGTH_MARGIN else "Average"
+        rows.append({
+            "Position": pos,
+            "Starters (pts/wk)": round(mine, 1),
+            "League avg": round(league_avg, 1),
+            "vs League": f"{diff:+.0%}",
+            "Status": label,
+        })
+    return rows
+
+
+# --------------------------------------------------------------------- trades
+
+def _notes(give, get, partner_name) -> List[str]:
+    notes = []
+    for p in give + get:
+        if p.injured:
+            notes.append(f"{p.name} is {p.injury.replace('_', ' ').title()}")
+        if p.weekly and p.weekly.count(0.0) and not p.injured:
+            notes.append(f"{p.name} has a bye in the window")
+    if len(give) > len(get):
+        notes.append(f"{partner_name} would need to drop {len(give) - len(get)} player(s)")
+    elif len(get) > len(give):
+        notes.append(f"You would need to drop {len(get) - len(give)} player(s)")
+    return notes
+
+
+def find_trades(
+    snapshot: LeagueSnapshot,
+    my_team_id: int,
+    min_gain: float = MIN_MY_GAIN,
+    max_results: int = 15,
+    per_partner: int = 3,
+) -> List[TradeProposal]:
+    """Rank trades that help me, help them, and are roughly even in value"""
+    n = len(snapshot.weeks)
+    slots = snapshot.slots
+    me = snapshot.teams.get(my_team_id)
+    if not me or n == 0:
+        return []
+
+    def useful(players):
+        return sorted((p for p in players if p.avg > 0), key=lambda p: p.avg, reverse=True)[:POOL_SIZE]
+
+    my_pool = useful(me.players)
+    my_before = lineup_total(me.players, slots, n)
+    proposals: List[TradeProposal] = []
+
+    for tid, other in snapshot.teams.items():
+        if tid == my_team_id:
+            continue
+        their_pool = useful(other.players)
+        their_before = lineup_total(other.players, slots, n)
+        found: List[TradeProposal] = []
+
+        # 1-for-1 gains, kept for every pair so multi-player swaps can be compared to them
+        single_gain: Dict[Tuple[int, int], float] = {}
+
+        for give_n, get_n in [(1, 1), (2, 1), (1, 2)]:
+            for give in combinations(my_pool, give_n):
+                for get in combinations(their_pool, get_n):
+                    give_value = sum(p.avg for p in give)
+                    get_value = sum(p.avg for p in get)
+                    if not max(give_value, get_value) or (
+                        min(give_value, get_value) / max(give_value, get_value) < MIN_VALUE_RATIO
+                    ):
+                        continue
+
+                    give_ids = {id(p) for p in give}
+                    get_ids = {id(p) for p in get}
+                    my_after = [p for p in me.players if id(p) not in give_ids] + list(get)
+                    my_gain = (lineup_total(my_after, slots, n) - my_before) / n
+
+                    if (give_n, get_n) == (1, 1):
+                        single_gain[(id(give[0]), id(get[0]))] = my_gain
+                    else:
+                        # skip swaps where the extra player adds nothing over a simpler 1-for-1
+                        simpler = max(
+                            single_gain.get((id(g), id(r)), float("-inf"))
+                            for g in give for r in get
+                        )
+                        if simpler >= my_gain - 0.25:
+                            continue
+                    if my_gain < min_gain:
+                        continue
+
+                    their_after = [p for p in other.players if id(p) not in get_ids] + list(give)
+                    their_gain = (lineup_total(their_after, slots, n) - their_before) / n
+                    if their_gain < MIN_THEIR_GAIN:
+                        continue
+
+                    found.append(TradeProposal(
+                        partner_id=tid,
+                        partner_name=other.name,
+                        give=list(give),
+                        get=list(get),
+                        my_gain=my_gain,
+                        their_gain=their_gain,
+                        notes=_notes(list(give), list(get), other.name),
+                    ))
+
+        found.sort(key=lambda t: t.score, reverse=True)
+        # keep the best few per partner, without repeating the same player on either side
+        used_give, used_get = set(), set()
+        for t in found:
+            gids, rids = {id(p) for p in t.give}, {id(p) for p in t.get}
+            if gids & used_give or rids & used_get:
+                continue
+            proposals.append(t)
+            used_give |= gids
+            used_get |= rids
+            if len(used_give) >= per_partner * 2:
+                break
+
+    proposals.sort(key=lambda t: t.score, reverse=True)
+    return proposals[:max_results]
+
+
+# ------------------------------------------------------------ ESPN integration
+
+def _fetch_ratings(league, weeks: List[int]) -> Dict[int, Dict[str, Dict[str, int]]]:
+    """{week: {position: {opposing pro team abbrev: rank}}}; empty for weeks that fail"""
+    from espn_api.football.constant import PRO_TEAM_MAP
+
+    abbrev = {str(k): v for k, v in PRO_TEAM_MAP.items()}
+    pos_by_id = {v: k for k, v in MATCHUP_POSITIONS.items()}
+    out: Dict[int, Dict[str, Dict[str, int]]] = {}
+    for week in weeks:
+        try:
+            raw = league._get_positional_ratings(week)
+        except Exception as e:
+            logger.warning(f"Could not load matchup ratings for week {week}: {e}")
+            continue
+        out[week] = {
+            pos_by_id[pid]: {abbrev.get(tid, tid): rank for tid, rank in by_team.items()}
+            for pid, by_team in raw.items()
+            if pid in pos_by_id
+        }
+    return out
+
+
+def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnapshot:
+    """Read an espn_api League into plain data the engine can work on"""
+    current = getattr(league, "current_week", None) or getattr(league, "nfl_week", 1)
+    last_week = 18
+    weeks = list(range(current, min(current + weeks_ahead, last_week + 1)))
+    ratings = _fetch_ratings(league, weeks)
+
+    teams = {}
+    for team in league.teams:
+        teams[team.team_id] = TeamSnapshot(
+            team_id=team.team_id,
+            name=team.team_name,
+            players=[build_player_value(p, weeks, ratings) for p in team.roster],
+        )
+
+    return LeagueSnapshot(
+        teams=teams,
+        slots=build_slots(league.settings.position_slot_counts),
+        weeks=weeks,
+        schedule_adjusted=bool(ratings),
+    )
