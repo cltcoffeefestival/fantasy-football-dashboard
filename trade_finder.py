@@ -404,6 +404,14 @@ def trade_values(snapshot: "LeagueSnapshot") -> Dict[int, float]:
     return values
 
 
+def cut_order(players: List[PlayerValue], roles: Dict[int, Tuple[str, float]], tv: Dict[int, float]) -> List[PlayerValue]:
+    """Players in the order a team would cut them: bench before starters, then lowest trade value"""
+    return sorted(
+        players,
+        key=lambda p: (roles.get(id(p), ("Bench", 0.0))[0] == "Starter", tv[id(p)], p.avg),
+    )
+
+
 def classify(my_gain: float, their_gain: float, give_value: float, get_value: float) -> str:
     """How likely the other team is to say yes"""
     top = max(give_value, get_value)
@@ -448,20 +456,17 @@ def find_trades(
     def useful(players):
         return sorted((p for p in players if p.avg > 0), key=lambda p: p.avg, reverse=True)[:POOL_SIZE]
 
-    def by_value(players):
-        return sorted(players, key=lambda p: (tv[id(p)], p.avg))
-
     my_pool = useful(me.players)
-    my_cheapest = by_value(me.players)
     my_before = lineup_total(me.players, slots, n)
     my_roles = team_analysis(snapshot, me)
+    my_cheapest = cut_order(me.players, my_roles, tv)
     proposals: List[TradeProposal] = []
 
     def search_partner(tid, other, min_gain, min_their, min_ratio) -> List[TradeProposal]:
         their_pool = useful(other.players)
         their_before = lineup_total(other.players, slots, n)
-        their_cheapest = by_value(other.players)
         their_roles = team_analysis(snapshot, other)
+        their_cheapest = cut_order(other.players, their_roles, tv)
         found: List[TradeProposal] = []
 
         # 1-for-1 gains, kept for every pair so multi-player swaps can be compared to them
