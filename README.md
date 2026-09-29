@@ -7,7 +7,7 @@ A comprehensive web dashboard to analyze your ESPN Fantasy Football teams across
 - **Dashboard**: team cards for every league, sorted by standing, with your own teams highlighted
 - **My Teams**: record, standing, points per week and the roster grouped by position
 - **Waiver Wire**: best available free agent at each position, plus a filterable free agent table
-- **Trade Finder**: scans every roster for strengths and weaknesses and suggests trades that help both sides, using projections, injuries, byes and upcoming matchup difficulty
+- **Trade Finder**: scans every roster for strengths and weaknesses and suggests trades that help both sides, measured by net weekly lineup impact (optimal lineup before vs. after, with waiver-wire baselines filling any slot a player can't beat), using projections, injuries, byes and upcoming matchup difficulty
 - **Team Analysis**: team summary
 - **Standings**: points-for chart and full standings for each league
 

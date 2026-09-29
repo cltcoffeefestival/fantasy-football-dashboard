@@ -58,11 +58,16 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
 TIER_ICONS = {"Win-win": "🟢", "Worth a shot": "🟡", "Long shot": "🟠"}
 
 
-def format_players(players):
+def format_players(players, info):
+    """Player line with their role on their current team and what they're worth there"""
     parts = []
-    for p in players:
+    for p, (role, value) in zip(players, info):
         flag = f" ⚠️ {p.injury.replace('_', ' ').title()}" if p.injured else ""
-        parts.append(f"**{p.name}** ({p.position}, {p.avg:.1f} pts/wk){flag}")
+        if role == "Starter":
+            detail = f"{p.position} · Starter · {value:.1f} pts/wk"
+        else:
+            detail = f"{p.position} · Bench · {p.base:.1f} avg, adds {value:.1f} pts/wk"
+        parts.append(f"**{p.name}** ({detail}){flag}")
     return " + ".join(parts)
 
 
@@ -70,11 +75,15 @@ def render_trade(t):
     """One trade card"""
     with st.container(border=True):
         st.markdown(f"{TIER_ICONS[t.tier]} **{t.tier}**")
-        st.markdown(f"You give: {format_players(t.give)}")
-        st.markdown(f"You get: {format_players(t.get)}")
+        st.markdown(f"You give: {format_players(t.give, t.give_info)}")
+        st.markdown(f"You get: {format_players(t.get, t.get_info)}")
         m1, m2 = st.columns(2)
-        m1.metric("Your lineup", f"+{t.my_gain:.1f} pts/wk")
-        m2.metric(f"{t.partner_name} lineup", f"{t.their_gain:+.1f} pts/wk")
+        m1.metric("Your net lineup impact", f"{t.my_gain:+.1f} pts/wk")
+        m2.metric(f"{t.partner_name} net lineup impact", f"{t.their_gain:+.1f} pts/wk")
+        st.caption(
+            f"Starting points per week: you {t.my_before:.1f} → {t.my_after:.1f} · "
+            f"{t.partner_name} {t.their_before:.1f} → {t.their_after:.1f}"
+        )
         st.caption(f"Trade value: you give {t.give_value:.0f} · you get {t.get_value:.0f}")
         for note in t.notes:
             st.caption(f"⚠️ {note}")
