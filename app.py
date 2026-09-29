@@ -55,6 +55,9 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
     return build_league_snapshot(_lm.leagues[league_name], weeks_ahead)
 
 
+TIER_ICONS = {"Win-win": "🟢", "Worth a shot": "🟡", "Long shot": "🟠"}
+
+
 def format_players(players):
     parts = []
     for p in players:
@@ -324,6 +327,16 @@ def main():
         with c2:
             min_gain = st.slider("Minimum gain for you (pts/week)", 0.5, 5.0, 1.0, 0.5)
 
+        c3, c4 = st.columns(2)
+        with c3:
+            creative = st.toggle(
+                "Include creative / long-shot trades",
+                value=True,
+                help="Adds bigger packages (2-for-2, 3-for-1) and trades the other team may need convincing on.",
+            )
+        with c4:
+            focus = st.multiselect("Only trades that bring back a", ["QB", "RB", "WR", "TE", "D/ST", "K"])
+
         snapshot = cached_snapshot(league_manager, league_name, weeks_ahead)
         if team_id not in snapshot.teams:
             st.warning("Team not found in league data")
@@ -338,17 +351,20 @@ def main():
             st.dataframe(needs_table(snapshot.teams, snapshot.slots, team_id), width="stretch", hide_index=True)
 
             st.subheader("Recommended trades")
-            trades = find_trades(snapshot, team_id, min_gain=min_gain)
+            trades = find_trades(
+                snapshot, team_id, min_gain=min_gain, max_results=25 if creative else 15,
+                per_partner=4 if creative else 3, creative=creative, focus_positions=focus,
+            )
             if not trades:
                 st.info("No trades clear the bar right now. Try lowering the minimum gain or looking further ahead.")
             for t in trades:
                 with st.container(border=True):
-                    st.markdown(f"**Trade with {t.partner_name}**")
+                    st.markdown(f"**Trade with {t.partner_name}** · {TIER_ICONS[t.tier]} {t.tier}")
                     st.markdown(f"You give: {format_players(t.give)}")
                     st.markdown(f"You get: {format_players(t.get)}")
                     m1, m2 = st.columns(2)
                     m1.metric("Your lineup", f"+{t.my_gain:.1f} pts/wk")
-                    m2.metric(f"{t.partner_name} lineup", f"+{t.their_gain:.1f} pts/wk")
+                    m2.metric(f"{t.partner_name} lineup", f"{t.their_gain:+.1f} pts/wk")
                     for note in t.notes:
                         st.caption(f"⚠️ {note}")
 

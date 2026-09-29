@@ -47,6 +47,10 @@ MATCHUP_POSITIONS = {"QB": "1", "RB": "2", "WR": "3", "TE": "4"}  # ESPN default
 MIN_MY_GAIN = 1.0        # pts/week
 MIN_THEIR_GAIN = 0.25    # pts/week: otherwise they have no reason to accept
 MIN_VALUE_RATIO = 0.7    # raw value given vs. received must be within 30%
+# Creative mode loosens the partner-side filters so longer shots and bigger packages show up
+CREATIVE_MIN_THEIR_GAIN = -1.5
+CREATIVE_MIN_VALUE_RATIO = 0.5
+CREATIVE_COMBOS = [(2, 2), (3, 1), (1, 3)]
 POOL_SIZE = 8            # top players per side considered in a swap
 STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
 
@@ -76,6 +80,9 @@ class TeamSnapshot:
     players: List[PlayerValue]
 
 
+TIER_ORDER = ["Win-win", "Worth a shot", "Long shot"]
+
+
 @dataclass
 class TradeProposal:
     partner_id: int
@@ -85,6 +92,12 @@ class TradeProposal:
     my_gain: float
     their_gain: float
     notes: List[str]
+    tier: str = "Win-win"
+
+    @property
+    def rank_key(self) -> tuple:
+        """Likelier trades first, then biggest combined gain"""
+        return (TIER_ORDER.index(self.tier), -self.score)
 
     @property
     def score(self) -> float:
@@ -241,14 +254,35 @@ def _notes(give, get, partner_name) -> List[str]:
     return notes
 
 
+def classify(their_gain: float, give_value: float, get_value: float) -> str:
+    """How likely the other team is to say yes"""
+    ratio = min(give_value, get_value) / max(give_value, get_value) if max(give_value, get_value) else 0
+    if their_gain >= MIN_THEIR_GAIN and ratio >= MIN_VALUE_RATIO:
+        return "Win-win"
+    if their_gain >= 0 or give_value >= get_value:
+        return "Worth a shot"
+    return "Long shot"
+
+
 def find_trades(
     snapshot: LeagueSnapshot,
     my_team_id: int,
     min_gain: float = MIN_MY_GAIN,
     max_results: int = 15,
     per_partner: int = 3,
+    creative: bool = False,
+    focus_positions: Optional[List[str]] = None,
 ) -> List[TradeProposal]:
-    """Rank trades that help me, help them, and are roughly even in value"""
+    """Rank trades that help me, help them, and are roughly even in value.
+
+    creative=True also returns longer shots (the other team gains little or loses a bit of
+    lineup value, or you overpay in raw value) and bigger packages (2-for-2, 3-for-1, 1-for-3).
+    focus_positions keeps only trades that bring back a player at one of those positions.
+    """
+    min_their = CREATIVE_MIN_THEIR_GAIN if creative else MIN_THEIR_GAIN
+    min_ratio = CREATIVE_MIN_VALUE_RATIO if creative else MIN_VALUE_RATIO
+    combos = [(1, 1), (2, 1), (1, 2)] + (CREATIVE_COMBOS if creative else [])
+    focus = set(focus_positions or [])
     n = len(snapshot.weeks)
     slots = snapshot.slots
     me = snapshot.teams.get(my_team_id)
@@ -272,13 +306,13 @@ def find_trades(
         # 1-for-1 gains, kept for every pair so multi-player swaps can be compared to them
         single_gain: Dict[Tuple[int, int], float] = {}
 
-        for give_n, get_n in [(1, 1), (2, 1), (1, 2)]:
+        for give_n, get_n in combos:
             for give in combinations(my_pool, give_n):
                 for get in combinations(their_pool, get_n):
                     give_value = sum(p.avg for p in give)
                     get_value = sum(p.avg for p in get)
                     if not max(give_value, get_value) or (
-                        min(give_value, get_value) / max(give_value, get_value) < MIN_VALUE_RATIO
+                        min(give_value, get_value) / max(give_value, get_value) < min_ratio
                     ):
                         continue
 
@@ -299,10 +333,12 @@ def find_trades(
                             continue
                     if my_gain < min_gain:
                         continue
+                    if focus and not any(p.position in focus for p in get):
+                        continue
 
                     their_after = [p for p in other.players if id(p) not in get_ids] + list(give)
                     their_gain = (lineup_total(their_after, slots, n) - their_before) / n
-                    if their_gain < MIN_THEIR_GAIN:
+                    if their_gain < min_their:
                         continue
 
                     found.append(TradeProposal(
@@ -313,11 +349,13 @@ def find_trades(
                         my_gain=my_gain,
                         their_gain=their_gain,
                         notes=_notes(list(give), list(get), other.name),
+                        tier=classify(their_gain, give_value, get_value),
                     ))
 
-        found.sort(key=lambda t: t.score, reverse=True)
+        found.sort(key=lambda t: t.rank_key)
         # keep the best few per partner, without repeating the same player on either side
         used_give, used_get = set(), set()
+        kept = 0
         for t in found:
             gids, rids = {id(p) for p in t.give}, {id(p) for p in t.get}
             if gids & used_give or rids & used_get:
@@ -325,10 +363,11 @@ def find_trades(
             proposals.append(t)
             used_give |= gids
             used_get |= rids
-            if len(used_give) >= per_partner * 2:
+            kept += 1
+            if kept >= per_partner:
                 break
 
-    proposals.sort(key=lambda t: t.score, reverse=True)
+    proposals.sort(key=lambda t: t.rank_key)
     return proposals[:max_results]
 
 
