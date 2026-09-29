@@ -5,12 +5,17 @@ How it works
 1. Each player gets a weekly value for the next N weeks:
    blend of season average and projection, x opponent matchup, x injury availability,
    and 0 on bye weeks.
-2. Each team's best lineup is built from the league's real lineup slots (incl. flex).
-3. Candidate 1-for-1, 2-for-1 and 1-for-2 swaps with every other team are scored by
-   how much they change BOTH teams' lineup totals. A trade is only suggested when it
-   helps you meaningfully, helps them at least a little, and is roughly even in raw value.
+2. Each team's best lineup is built from the league's real lineup slots (incl. flex). Any slot
+   a rostered player can't beat (bye, injury, empty) is filled by a waiver-wire baseline, so
+   bench players only count for what they add over a free pickup.
+3. Candidate swaps with every other team are scored by the net change in weekly starting
+   points (optimal lineup before vs. after) for BOTH teams. A trade is only suggested when it
+   helps you meaningfully, helps them at least a little, and is roughly even in value.
+4. Each player also gets an effective value (get_effective_value): starters count at their full
+   projected average; bench players only for the bye weeks they cover, amortized over the season.
 """
 from dataclasses import dataclass, field
+from functools import lru_cache
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -61,6 +66,11 @@ CREATIVE_COMBOS = [(2, 2), (3, 1), (1, 3)]
 POOL_SIZE = 8            # top players per side considered in a swap
 STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
 
+# Estimated waiver-wire replacement level (pts/wk) for a standard league. QB/RB/WR/TE are the
+# agreed baselines; D/ST and K are my additions. Tune these if your scoring differs.
+WAIVER_BASELINES = {"QB": 12.5, "RB": 7.0, "WR": 8.0, "TE": 5.5, "D/ST": 6.0, "K": 7.0}
+SEASON_LAST_WEEK = 18
+
 
 @dataclass
 class PlayerValue:
@@ -70,6 +80,7 @@ class PlayerValue:
     injury: str
     base: float                # blended points per game
     weekly: List[float] = field(default_factory=list)
+    bye_weeks: List[int] = field(default_factory=list)   # remaining bye weeks this season
 
     @property
     def avg(self) -> float:
@@ -103,6 +114,14 @@ class TradeProposal:
     tier: str = "Win-win"
     give_value: float = 0.0
     get_value: float = 0.0
+    # Net weekly lineup impact: optimal starting points per week before and after the trade
+    my_before: float = 0.0
+    my_after: float = 0.0
+    their_before: float = 0.0
+    their_after: float = 0.0
+    # (role, effective value) per player: my side's players in my lineup, theirs in theirs
+    give_info: List[Tuple[str, float]] = field(default_factory=list)
+    get_info: List[Tuple[str, float]] = field(default_factory=list)
 
     @property
     def rank_key(self) -> tuple:
@@ -120,6 +139,8 @@ class LeagueSnapshot:
     slots: List[Tuple[str, frozenset]]
     weeks: List[int]
     schedule_adjusted: bool
+    season_weeks_remaining: int = 1
+    analysis: Dict[int, Dict[int, Tuple[str, float]]] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------- player values
@@ -149,7 +170,23 @@ def matchup_factor(rank: Optional[int]) -> float:
     return 1 + MATCHUP_SWING * ((rank - 16.5) / 15.5)
 
 
-def build_player_value(player, weeks: List[int], ratings: Dict[int, Dict[str, Dict[str, int]]]) -> PlayerValue:
+def remaining_byes(schedule: dict, current_week: int, last_week: int = SEASON_LAST_WEEK) -> List[int]:
+    """Weeks from now to season end with no game. Only trusts weeks the schedule actually covers."""
+    if not schedule:
+        return []
+    covered = max(int(w) for w in schedule)
+    return [
+        w for w in range(current_week, min(last_week, covered) + 1)
+        if not (schedule.get(str(w)) or schedule.get(w))
+    ]
+
+
+def build_player_value(
+    player,
+    weeks: List[int],
+    ratings: Dict[int, Dict[str, Dict[str, int]]],
+    current_week: Optional[int] = None,
+) -> PlayerValue:
     """Turn an espn_api Player into a PlayerValue over the given weeks"""
     injury = (getattr(player, "injuryStatus", "") or "ACTIVE").upper()
     position = getattr(player, "position", "")
@@ -181,6 +218,7 @@ def build_player_value(player, weeks: List[int], ratings: Dict[int, Dict[str, Di
         injury=injury,
         base=base,
         weekly=weekly,
+        bye_weeks=remaining_byes(schedule, current_week or (weeks[0] if weeks else 1)),
     )
 
 
@@ -198,19 +236,98 @@ def build_slots(position_slot_counts: Dict[str, int]) -> List[Tuple[str, frozens
     return slots
 
 
+@lru_cache(maxsize=None)
+def _slot_waiver(eligible: frozenset) -> float:
+    """What a waiver pickup is worth in a slot: the best baseline among eligible positions"""
+    return max((WAIVER_BASELINES.get(pos, 0.0) for pos in eligible), default=0.0)
+
+
+def _solve_week(players: List[PlayerValue], slots, week: int):
+    """Best lineup for one week. Returns (points, players who start).
+
+    A slot goes to the best available rostered player, unless a waiver pickup would score more
+    (bye, injury, or an empty slot), in which case the slot is filled at the waiver baseline.
+    """
+    ranked = sorted(players, key=lambda p: p.weekly[week], reverse=True)
+    used = set()
+    total = 0.0
+    starters = []
+    for _, eligible in slots:
+        waiver = _slot_waiver(eligible)
+        for idx, p in enumerate(ranked):
+            if idx not in used and p.position in eligible:
+                if p.weekly[week] >= waiver:
+                    used.add(idx)
+                    total += p.weekly[week]
+                    starters.append(p)
+                else:
+                    total += waiver
+                break
+        else:
+            total += waiver
+    return total, starters
+
+
 def lineup_total(players: List[PlayerValue], slots, n_weeks: int) -> float:
     """Sum of the best possible lineup for each upcoming week"""
-    total = 0.0
+    return sum(_solve_week(players, slots, w)[0] for w in range(n_weeks))
+
+
+def weeks_started(players: List[PlayerValue], slots, n_weeks: int) -> Dict[int, int]:
+    """How many of the upcoming weeks each player is in the optimal lineup"""
+    counts: Dict[int, int] = {}
     for w in range(n_weeks):
-        ranked = sorted(players, key=lambda p: p.weekly[w], reverse=True)
-        used = set()
-        for _, eligible in slots:
-            for idx, p in enumerate(ranked):
-                if idx not in used and p.position in eligible:
-                    used.add(idx)
-                    total += p.weekly[w]
-                    break
-    return total
+        for p in _solve_week(players, slots, w)[1]:
+            counts[id(p)] = counts.get(id(p), 0) + 1
+    return counts
+
+
+def analyze_team(team: TeamSnapshot, slots, n_weeks: int, season_weeks_remaining: int) -> Dict[int, Tuple[str, float]]:
+    """Role and effective weekly value of every player on a team, before any trade.
+
+    Starter (in the optimal lineup at least half of the window): full projected average.
+    Bench: only what he adds over a waiver pickup while covering the remaining bye weeks of the
+    starters at his position, amortized over the remaining season:
+        max(0, avg - waiver baseline) * bye weeks covered / weeks remaining
+    Only the best backup at each position gets that credit.
+    """
+    started = weeks_started(team.players, slots, n_weeks)
+    starters = [p for p in team.players if started.get(id(p), 0) * 2 >= n_weeks and started.get(id(p), 0) > 0]
+    starter_ids = {id(p) for p in starters}
+
+    result: Dict[int, Tuple[str, float]] = {id(p): ("Starter", p.base) for p in starters}
+
+    covered_byes: Dict[str, set] = {}
+    for p in starters:
+        covered_byes.setdefault(p.position, set()).update(p.bye_weeks)
+
+    bench: Dict[str, List[PlayerValue]] = {}
+    for p in team.players:
+        if id(p) not in starter_ids:
+            bench.setdefault(p.position, []).append(p)
+    for pos, players in bench.items():
+        players.sort(key=lambda p: p.base, reverse=True)
+        for rank, p in enumerate(players):
+            value = 0.0
+            if rank == 0:
+                weeks_covered = len(covered_byes.get(pos, set()) - set(p.bye_weeks))
+                upside = max(0.0, p.base - WAIVER_BASELINES.get(pos, 0.0))
+                value = upside * weeks_covered / max(1, season_weeks_remaining)
+            result[id(p)] = ("Bench", value)
+    return result
+
+
+def team_analysis(snapshot: "LeagueSnapshot", team: TeamSnapshot) -> Dict[int, Tuple[str, float]]:
+    if team.team_id not in snapshot.analysis:
+        snapshot.analysis[team.team_id] = analyze_team(
+            team, snapshot.slots, len(snapshot.weeks), snapshot.season_weeks_remaining
+        )
+    return snapshot.analysis[team.team_id]
+
+
+def get_effective_value(player: PlayerValue, team: TeamSnapshot, snapshot: "LeagueSnapshot") -> float:
+    """Weekly value of a player to the team that owns him (starter vs. bench rules above)"""
+    return team_analysis(snapshot, team).get(id(player), ("Bench", 0.0))[1]
 
 
 def position_strengths(teams: Dict[int, TeamSnapshot], slots) -> Dict[int, Dict[str, float]]:
@@ -270,30 +387,13 @@ def side_value(players, tv: Dict[int, float]) -> float:
     return sum(values) + (STAR_PREMIUM - 1) * max(values, default=0.0)
 
 
-def replacement_levels(snapshot: "LeagueSnapshot") -> Dict[str, float]:
-    """Points/game of the last starter at each position league-wide (what a waiver pickup roughly gives you)"""
-    slots_per_team: Dict[str, float] = {}
-    for _, eligible in snapshot.slots:
-        for pos in eligible:
-            slots_per_team[pos] = slots_per_team.get(pos, 0.0) + 1 / len(eligible)
-    levels = {}
-    for pos, per_team in slots_per_team.items():
-        bases = sorted(
-            (p.base for t in snapshot.teams.values() for p in t.players if p.position == pos),
-            reverse=True,
-        )
-        cutoff = round(per_team * len(snapshot.teams))
-        levels[pos] = bases[cutoff - 1] if 0 < cutoff <= len(bases) else 0.0
-    return levels
-
-
 def trade_values(snapshot: "LeagueSnapshot") -> Dict[int, float]:
     """How an owner would value each player in a trade: points over replacement, stars weighted up.
 
     Ignores byes and matchups (owners don't discount a player for a bye), and only discounts
     serious injuries. This is separate from the lineup value used to measure the gain.
     """
-    levels = replacement_levels(snapshot)
+    levels = WAIVER_BASELINES
     values = {}
     for team in snapshot.teams.values():
         for p in team.players:
@@ -352,12 +452,14 @@ def find_trades(
     my_pool = useful(me.players)
     my_cheapest = by_value(me.players)
     my_before = lineup_total(me.players, slots, n)
+    my_roles = team_analysis(snapshot, me)
     proposals: List[TradeProposal] = []
 
     def search_partner(tid, other, min_gain, min_their, min_ratio) -> List[TradeProposal]:
         their_pool = useful(other.players)
         their_before = lineup_total(other.players, slots, n)
         their_cheapest = by_value(other.players)
+        their_roles = team_analysis(snapshot, other)
         found: List[TradeProposal] = []
 
         # 1-for-1 gains, kept for every pair so multi-player swaps can be compared to them
@@ -383,7 +485,8 @@ def find_trades(
                     my_after = [
                         p for p in me.players if id(p) not in give_ids and id(p) not in my_drop_ids
                     ] + list(get)
-                    my_gain = (lineup_total(my_after, slots, n) - my_before) / n
+                    my_after_total = lineup_total(my_after, slots, n)
+                    my_gain = (my_after_total - my_before) / n
 
                     if (give_n, get_n) == (1, 1):
                         single_gain[(id(give[0]), id(get[0]))] = my_gain
@@ -404,7 +507,8 @@ def find_trades(
                     their_after = [
                         p for p in other.players if id(p) not in get_ids and id(p) not in their_drop_ids
                     ] + list(give)
-                    their_gain = (lineup_total(their_after, slots, n) - their_before) / n
+                    their_after_total = lineup_total(their_after, slots, n)
+                    their_gain = (their_after_total - their_before) / n
                     if their_gain < min_their:
                         continue
 
@@ -419,6 +523,12 @@ def find_trades(
                         tier=classify(my_gain, their_gain, give_value, get_value),
                         give_value=give_value,
                         get_value=get_value,
+                        my_before=my_before / n,
+                        my_after=my_after_total / n,
+                        their_before=their_before / n,
+                        their_after=their_after_total / n,
+                        give_info=[my_roles.get(id(p), ("Bench", 0.0)) for p in give],
+                        get_info=[their_roles.get(id(p), ("Bench", 0.0)) for p in get],
                     ))
 
         found.sort(key=lambda t: t.rank_key)
@@ -491,7 +601,7 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
         teams[team.team_id] = TeamSnapshot(
             team_id=team.team_id,
             name=team.team_name,
-            players=[build_player_value(p, weeks, ratings) for p in team.roster],
+            players=[build_player_value(p, weeks, ratings, current) for p in team.roster],
             record=f"{team.wins}-{team.losses}",
         )
 
@@ -500,4 +610,5 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
         slots=build_slots(league.settings.position_slot_counts),
         weeks=weeks,
         schedule_adjusted=bool(ratings),
+        season_weeks_remaining=max(1, last_week - current + 1),
     )
