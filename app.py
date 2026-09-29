@@ -9,6 +9,8 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from config import LEAGUES
 import logging
+from pathlib import Path
+import html
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -21,66 +23,15 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Custom CSS styling
-st.markdown("""
-    <style>
-    .metric-card {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        text-align: center;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
+def load_css():
+    """Inject the shared stylesheet"""
+    css = (Path(__file__).parent / "assets" / "style.css").read_text()
+    st.markdown(f"<style>{css}</style>", unsafe_allow_html=True)
 
-    .team-card {
-        background: linear-gradient(135deg, #f093fb 0%, #f5576c 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        margin: 10px 0;
-        box-shadow: 0 4px 6px rgba(0, 0, 0, 0.1);
-    }
 
-    .record-good {
-        color: #00cc44;
-        font-weight: bold;
-    }
+load_css()
 
-    .record-bad {
-        color: #ff4444;
-        font-weight: bold;
-    }
-
-    .header-banner {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-        padding: 20px;
-        border-radius: 10px;
-        color: white;
-        margin-bottom: 20px;
-    }
-
-    .stat-box {
-        background: #f8f9fa;
-        padding: 15px;
-        border-radius: 8px;
-        border-left: 4px solid #667eea;
-        margin: 10px 0;
-    }
-
-    h1 {
-        color: #667eea;
-    }
-
-    h2 {
-        color: #764ba2;
-        border-bottom: 2px solid #667eea;
-        padding-bottom: 10px;
-    }
-    </style>
-""", unsafe_allow_html=True)
-
-@st.cache_resource
+@st.cache_resource(ttl=900, show_spinner="Loading leagues from ESPN...")
 def load_league_data():
     """Load league data with caching"""
     try:
@@ -91,68 +42,82 @@ def load_league_data():
         return None
 
 
-def format_record(wins, losses):
-    """Format win-loss record with colors"""
-    return f"{wins}W - {losses}L"
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_free_agents(_lm, league_name, limit):
+    """Free agent lookups hit ESPN every call, so cache them briefly"""
+    return _lm.get_free_agents(league_name, limit=limit)
 
 
-def get_record_color(wins, losses):
-    """Get color based on win percentage"""
+def record_class(wins, losses):
+    """CSS class for a record based on win percentage"""
     total = wins + losses
     if total == 0:
-        return "#999999"
+        return "rec-none"
     win_pct = wins / total
     if win_pct >= 0.6:
-        return "#00cc44"  # Green for winning record
-    elif win_pct >= 0.4:
-        return "#ffaa00"  # Orange for .500
-    else:
-        return "#ff4444"  # Red for losing record
+        return "rec-good"
+    if win_pct >= 0.4:
+        return "rec-mid"
+    return "rec-bad"
+
+
+def render_team_card(team):
+    """One team card: rank, record, points"""
+    wins, losses = int(team["Wins"]), int(team["Losses"])
+    you_badge = '<span class="rank-badge">YOU</span>' if team.get("Mine") else ""
+    with st.container(border=True):
+        st.markdown(
+            f'<div class="team-card-name">{html.escape(str(team["Team"]))}'
+            f' {you_badge}</div>'
+            f'<div class="team-card-record {record_class(wins, losses)}">{wins}-{losses}</div>'
+            f'<div class="team-card-meta">'
+            f'<span class="rank-badge">#{int(team["Standing"])}</span>'
+            f'{team["Points For"]:.1f} PF · {team["Points Against"]:.1f} PA</div>',
+            unsafe_allow_html=True,
+        )
 
 
 def create_standings_visual(standings_df):
-    """Create a visual standings chart"""
+    """Horizontal bar chart of points for, best team on top"""
     if standings_df.empty:
         return None
 
-    # Create a color column based on standing
-    standings_df = standings_df.copy()
-    standings_df['color'] = standings_df.apply(
-        lambda row: get_record_color(int(row['W-L'].split('-')[0]), int(row['W-L'].split('-')[1])),
-        axis=1
-    )
-
-    fig = go.Figure(data=[
+    df = standings_df.sort_values("Points For")
+    fig = go.Figure(
         go.Bar(
-            y=standings_df['Team'],
-            x=standings_df['Points For'],
-            orientation='h',
-            marker=dict(color=standings_df['color']),
-            text=standings_df['Points For'],
-            textposition='auto',
+            y=df["Team"],
+            x=df["Points For"],
+            orientation="h",
+            marker=dict(color="#4f46e5"),
+            text=df["Points For"],
+            textposition="outside",
+            cliponaxis=False,
+            hovertemplate="%{y}<br>%{x} PF<extra></extra>",
         )
-    ])
-
-    fig.update_layout(
-        title="League Points For",
-        xaxis_title="Points For",
-        yaxis_title="Team",
-        height=400,
-        showlegend=False,
-        template="plotly_white"
     )
-
+    fig.update_layout(
+        height=max(300, 34 * len(df) + 80),
+        showlegend=False,
+        margin=dict(l=0, r=40, t=10, b=0),
+        xaxis_title=None,
+        yaxis_title=None,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="rgba(128,128,128,0.2)")
     return fig
 
 
 def main():
-    # Header
-    st.markdown("""
-    <div class="header-banner">
-        <h1 style="margin: 0; color: white;">🏈 Fantasy Football Dashboard</h1>
-        <p style="margin: 5px 0 0 0;">Your complete fantasy football control center</p>
+    st.markdown(
+        """
+    <div class="app-header">
+        <h1>Fantasy Football Dashboard</h1>
+        <p>All your ESPN leagues in one place</p>
     </div>
-    """, unsafe_allow_html=True)
+    """,
+        unsafe_allow_html=True,
+    )
 
     # Initialize league manager
     league_manager = load_league_data()
@@ -176,92 +141,73 @@ def main():
         ],
     )
 
+    # Shared league / team picker (set once, used by every page)
+    for name, err in league_manager.load_errors.items():
+        st.sidebar.warning(f"Could not load **{name}**: {err}")
+
+    st.sidebar.divider()
+    league_name = st.sidebar.selectbox("League", list(league_manager.leagues.keys()))
+    league = league_manager.leagues[league_name]
+    team_options = {team.team_name: team.team_id for team in league.teams}
+    my_names = [t.team_name for t in league.teams if league_manager.is_my_team(t)]
+    default_idx = list(team_options).index(my_names[0]) if my_names else 0
+    selected_team = st.sidebar.selectbox(
+        "Your team", list(team_options.keys()), index=default_idx, key=f"team_{league_name}"
+    )
+    team_id = team_options[selected_team]
+    if not my_names:
+        st.sidebar.caption("Couldn't match your SWID to a team; pick yours above.")
+
+    st.sidebar.divider()
+    if st.sidebar.button("🔄 Refresh data", width="stretch"):
+        st.cache_resource.clear()
+        st.cache_data.clear()
+        st.rerun()
+
     # Page: Dashboard / Overview
     if page == "🏠 Dashboard":
-        st.header("📊 League Overview")
-
         all_teams = league_manager.get_user_teams()
 
-        if not all_teams.empty:
-            # Top metrics
-            col1, col2, col3, col4 = st.columns(4)
-
-            with col1:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>📍 Leagues</h3>
-                    <h1>{len(league_manager.leagues)}</h1>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col2:
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>👥 Teams</h3>
-                    <h1>{len(all_teams)}</h1>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col3:
-                total_wins = all_teams['Wins'].sum()
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>🏅 Total Wins</h3>
-                    <h1>{int(total_wins)}</h1>
-                </div>
-                """, unsafe_allow_html=True)
-
-            with col4:
-                total_pf = all_teams['Points For'].sum()
-                st.markdown(f"""
-                <div class="metric-card">
-                    <h3>📈 Total PF</h3>
-                    <h1>{total_pf:.0f}</h1>
-                </div>
-                """, unsafe_allow_html=True)
-
-            st.markdown("---")
-            st.subheader("Your Teams by League")
-
-            for league in league_manager.leagues.keys():
-                league_teams = all_teams[all_teams['League'] == league]
-
-                with st.expander(f"**{league}** ({len(league_teams)} teams)", expanded=True):
-                    cols = st.columns(len(league_teams)) if len(league_teams) > 0 else [st.columns(1)]
-
-                    for idx, (_, team) in enumerate(league_teams.iterrows()):
-                        with cols[idx]:
-                            wins = int(team['Wins'])
-                            losses = int(team['Losses'])
-                            record_color = get_record_color(wins, losses)
-
-                            st.markdown(f"""
-                            <div class="team-card">
-                                <h3>{team['Team']}</h3>
-                                <p style="font-size: 24px; margin: 10px 0;">
-                                    <span style="color: {record_color};">{wins}W - {losses}L</span>
-                                </p>
-                                <p>📍 Standing: #{team['Standing']}</p>
-                                <p>📈 Points: {team['Points For']:.1f}</p>
-                            </div>
-                            """, unsafe_allow_html=True)
-        else:
+        if all_teams.empty:
             st.warning("No team data available")
+        else:
+            only_mine = False
+            if all_teams["Mine"].any():
+                only_mine = st.toggle("Show only my teams", value=True)
+                if only_mine:
+                    all_teams = all_teams[all_teams["Mine"]]
+
+            col1, col2, col3, col4 = st.columns(4)
+            with col1:
+                with st.container(border=True):
+                    st.metric("Leagues", all_teams["League"].nunique())
+            with col2:
+                with st.container(border=True):
+                    st.metric("Teams", len(all_teams))
+            with col3:
+                with st.container(border=True):
+                    st.metric("Total Wins", int(all_teams["Wins"].sum()))
+            with col4:
+                with st.container(border=True):
+                    st.metric("Total Points For", f"{all_teams['Points For'].sum():,.0f}")
+
+            CARDS_PER_ROW = 4
+            for league in league_manager.leagues.keys():
+                league_teams = all_teams[all_teams["League"] == league].sort_values("Standing")
+                st.subheader(league)
+                rows = [
+                    league_teams.iloc[i : i + CARDS_PER_ROW]
+                    for i in range(0, len(league_teams), CARDS_PER_ROW)
+                ]
+                for row in rows:
+                    cols = st.columns(CARDS_PER_ROW)
+                    for col, (_, team) in zip(cols, row.iterrows()):
+                        with col:
+                            render_team_card(team)
 
     # Page: My Teams
     elif page == "👥 My Teams":
         st.header("👥 My Teams")
-
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-        )
-
-        league = league_manager.leagues[league_name]
-        team_options = {team.team_name: team.team_id for team in league.teams}
-
-        selected_team = st.selectbox("Select your team:", list(team_options.keys()))
-        team_id = team_options[selected_team]
 
         # Team Summary
         summary = analyzer.get_team_summary(league_name, team_id)
@@ -293,7 +239,7 @@ def main():
                     with st.expander(f"**{position}** ({len(pos_roster)} players)", expanded=True):
                         st.dataframe(
                             pos_roster[["Name", "Team", "Avg Points", "Projected"]],
-                            use_container_width=True,
+                            width="stretch",
                             hide_index=True,
                         )
         else:
@@ -303,27 +249,11 @@ def main():
     elif page == "📊 Waiver Wire":
         st.header("📋 Waiver Wire & Free Agents")
 
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-            key="waiver_league",
-        )
-
-        league = league_manager.leagues[league_name]
-        team_options = {team.team_name: team.team_id for team in league.teams}
-
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            selected_team = st.selectbox(
-                "Select your team:", list(team_options.keys()), key="waiver_team"
-            )
-            team_id = team_options[selected_team]
-        with col2:
-            limit = st.number_input("Top N free agents:", value=50, min_value=10)
+        limit = st.number_input("Free agents to consider:", value=50, min_value=10, step=10)
 
         # Recommended pickups
         st.subheader("🎯 Recommended Pickups by Position")
-        recommendations = analyzer.recommend_waiver_pickups(league_name, team_id, top_n=6)
+        recommendations = analyzer.recommend_waiver_pickups(league_name, team_id, pool_size=limit)
         if not recommendations.empty:
             cols = st.columns(3)
             for idx, (_, rec) in enumerate(recommendations.iterrows()):
@@ -342,7 +272,7 @@ def main():
         # All free agents
         st.markdown("---")
         st.subheader("📊 All Available Free Agents")
-        free_agents = league_manager.get_free_agents(league_name, limit=limit)
+        free_agents = cached_free_agents(league_manager, league_name, limit)
         if not free_agents.empty:
             free_agents_sorted = free_agents.sort_values("Avg Points", ascending=False)
 
@@ -357,7 +287,7 @@ def main():
 
             st.dataframe(
                 filtered_agents,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -366,20 +296,6 @@ def main():
     # Page: Team Analysis
     elif page == "🤝 Team Analysis":
         st.header("🔍 Team Analysis")
-
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-            key="analysis_league",
-        )
-
-        league = league_manager.leagues[league_name]
-        team_options = {team.team_name: team.team_id for team in league.teams}
-
-        selected_team = st.selectbox(
-            "Select your team:", list(team_options.keys()), key="analysis_team"
-        )
-        team_id = team_options[selected_team]
 
         col1, col2 = st.columns(2)
 
@@ -392,7 +308,7 @@ def main():
                 # Color code by standing
                 st.dataframe(
                     partners_df,
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
 
@@ -419,18 +335,12 @@ def main():
     elif page == "🏆 Standings":
         st.header("🏆 League Standings")
 
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-            key="standings_league",
-        )
-
         standings = league_manager.get_league_standings(league_name)
         if not standings.empty:
             # Create visual standings
             fig = create_standings_visual(standings)
             if fig:
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
             st.markdown("---")
 
@@ -443,7 +353,7 @@ def main():
 
             st.dataframe(
                 standings_display,
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:

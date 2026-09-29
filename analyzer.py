@@ -15,11 +15,11 @@ class TeamAnalyzer:
         self.league_manager = league_manager
 
     def recommend_waiver_pickups(
-        self, league_name: str, team_id: int, top_n: int = 10
+        self, league_name: str, team_id: int, pool_size: int = 100
     ) -> pd.DataFrame:
         """Recommend high-value waiver wire pickups based on avg points"""
         try:
-            free_agents = self.league_manager.get_free_agents(league_name, limit=100)
+            free_agents = self.league_manager.get_free_agents(league_name, limit=pool_size)
 
             if free_agents.empty:
                 return pd.DataFrame()

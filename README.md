@@ -4,17 +4,19 @@ A comprehensive web dashboard to analyze your ESPN Fantasy Football teams across
 
 ## Features
 
-- **📊 League Overview**: View all your teams and their standings
-- **👥 Team Analysis**: Detailed roster analysis with projected scores
-- **📋 Waiver Wire**: Position-specific recommendations for free agent pickups
-- **🤝 Trade Finder**: Identify potential trade partners based on team needs
-- **🏆 League Standings**: Full league standings and rankings
-- **🏥 Injury Report**: Track key player injuries across your leagues
-- **📈 Strength of Schedule**: Analyze upcoming matchups
+- **Dashboard**: team cards for every league, sorted by standing, with your own teams highlighted
+- **My Teams**: record, standing, points per week and the roster grouped by position
+- **Waiver Wire**: best available free agent at each position, plus a filterable free agent table
+- **Team Analysis**: trade partners ranked by closeness in record, and a team summary
+- **Standings**: points-for chart and full standings for each league
+
+A sidebar picker selects the league and team once for every page. Your team is
+detected by matching the `SWID` cookie to team owners. A Refresh button reloads
+data from ESPN (league data is otherwise cached for 15 minutes).
 
 ## Prerequisites
 
-- Python 3.8+
+- Python 3.9+
 - pip (Python package manager)
 - Your ESPN Fantasy Football league IDs
 
@@ -63,48 +65,34 @@ The dashboard will open in your browser at `http://localhost:8501`
 
 ```
 fantasy-football-dashboard/
-├── app.py              # Main Streamlit dashboard
-├── league_manager.py   # ESPN API integration
-├── analyzer.py         # Analysis and recommendations engine
-├── config.py          # Configuration (league IDs, settings)
-├── requirements.txt   # Python dependencies
-└── README.md          # This file
+├── app.py               # Streamlit UI
+├── assets/style.css     # Shared styling
+├── league_manager.py    # ESPN API integration
+├── analyzer.py          # Analysis and recommendations
+├── config.py            # League IDs and settings
+├── .streamlit/          # Theme and secrets template
+├── .env.example         # Credentials template
+└── requirements.txt
 ```
 
-## Usage
+## Configuration
 
-1. **Overview**: See a quick summary of all your teams and leagues
-2. **My Teams**: Drill into individual teams and view detailed rosters
-3. **Team Analysis**: Get strength of schedule and projected scores
-4. **Waiver Wire**: Find best available free agents by position
-5. **Trade Finder**: Identify teams with complementary needs
-6. **League Standings**: View complete league rankings
-7. **Injuries**: Track injured players across the league
+League IDs live in `config.py`. Credentials come from environment variables:
+copy `.env.example` to `.env` locally, or set `ESPN_S2` and `SWID` as secrets
+when deploying.
 
-## Recommendations Explained
+## Deploying to Streamlit Community Cloud
 
-### Waiver Wire Pickups
-Shows the highest-projected available player at each position that you might consider adding.
+1. Push the repo to GitHub and create an app at [share.streamlit.io](https://share.streamlit.io) with `app.py` as the main file.
+2. Under **Advanced settings → Secrets**, add `ESPN_S2` and `SWID` (see `.streamlit/secrets.toml.example`).
+3. Restrict viewing to specific emails under the app's sharing settings, since it uses your ESPN login.
 
-### Trade Partners
-Identifies teams whose strengths/weaknesses complement yours, suggesting good trade candidates.
-
-### Strength of Schedule
-Shows your team's upcoming matchups to help identify favorable/tough weeks.
-
-## Advanced Features (Coming Soon)
-
-- Historical performance trends
-- Player consistency analysis
-- Playoff readiness scores
-- Trade evaluation (fair value calculator)
-- Bench performance metrics
-- Bench vs. Start optimization
+If leagues stop loading, your ESPN cookies have probably expired: refresh them.
 
 ## Troubleshooting
 
 **"No leagues configured" error:**
-- Make sure you've edited `config.py` with valid league IDs
+- Make sure `config.py` has valid league IDs; failed leagues are listed in the sidebar
 
 **"Failed to load league" error:**
 - Verify your league ID is correct

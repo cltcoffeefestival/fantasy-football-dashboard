@@ -18,6 +18,7 @@ class LeagueManager:
         self.leagues_config = leagues_config or LEAGUES
         self.leagues = {}
         self.teams_data = {}
+        self.load_errors: Dict[str, str] = {}
         self.load_leagues()
 
     def load_leagues(self):
@@ -34,6 +35,18 @@ class LeagueManager:
                 logger.info(f"Loaded league: {key}")
             except Exception as e:
                 logger.error(f"Failed to load league {league_id}: {e}")
+                self.load_errors[name] = str(e)
+
+    def is_my_team(self, team) -> bool:
+        """True if the configured SWID is an owner of this team"""
+        if not SWID:
+            return False
+        want = SWID.strip("{}").lower()
+        for owner in getattr(team, "owners", None) or []:
+            owner_id = owner.get("id", "") if isinstance(owner, dict) else str(owner)
+            if owner_id.strip("{}").lower() == want:
+                return True
+        return False
 
     def get_user_teams(self) -> pd.DataFrame:
         """Get all user teams across all leagues"""
@@ -44,7 +57,7 @@ class LeagueManager:
                 teams.append({
                     "League": league_name,
                     "Team": team.team_name,
-                    "Owner": "You",
+                    "Mine": self.is_my_team(team),
                     "Wins": team.wins,
                     "Losses": team.losses,
                     "Points For": round(team.points_for, 1),
