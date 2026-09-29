@@ -365,6 +365,7 @@ def main():
                     m1, m2 = st.columns(2)
                     m1.metric("Your lineup", f"+{t.my_gain:.1f} pts/wk")
                     m2.metric(f"{t.partner_name} lineup", f"{t.their_gain:+.1f} pts/wk")
+                    st.caption(f"Trade value: you give {t.give_value:.0f} · you get {t.get_value:.0f}")
                     for note in t.notes:
                         st.caption(f"⚠️ {note}")
 

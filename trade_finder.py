@@ -45,11 +45,15 @@ MATCHUP_POSITIONS = {"QB": "1", "RB": "2", "WR": "3", "TE": "4"}  # ESPN default
 
 # Trade filters
 MIN_MY_GAIN = 1.0        # pts/week
-MIN_THEIR_GAIN = 0.25    # pts/week: otherwise they have no reason to accept
-MIN_VALUE_RATIO = 0.7    # raw value given vs. received must be within 30%
+MIN_THEIR_GAIN = 0.5     # pts/week: otherwise they have no reason to accept
+MIN_GAIN_BALANCE = 0.35  # their lineup gain must be at least this share of yours
+MIN_VALUE_RATIO = 0.85   # trade value given vs. received must be within ~15%
+SHOT_VALUE_RATIO = 0.7   # "worth a shot" trades can be a bit further apart
+VALUE_EXPONENT = 1.5     # stars are worth more than the sum of two mid players
+TRADE_INJURY_DISCOUNT = {"DOUBTFUL": 0.95, "OUT": 0.7, "SUSPENSION": 0.8, "INJURY_RESERVE": 0.5}
 # Creative mode loosens the partner-side filters so longer shots and bigger packages show up
 CREATIVE_MIN_THEIR_GAIN = -1.5
-CREATIVE_MIN_VALUE_RATIO = 0.5
+CREATIVE_MIN_VALUE_RATIO = 0.4
 CREATIVE_COMBOS = [(2, 2), (3, 1), (1, 3)]
 POOL_SIZE = 8            # top players per side considered in a swap
 STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
@@ -93,6 +97,8 @@ class TradeProposal:
     their_gain: float
     notes: List[str]
     tier: str = "Win-win"
+    give_value: float = 0.0
+    get_value: float = 0.0
 
     @property
     def rank_key(self) -> tuple:
@@ -101,7 +107,7 @@ class TradeProposal:
 
     @property
     def score(self) -> float:
-        return self.my_gain + 0.5 * self.their_gain
+        return self.my_gain + self.their_gain
 
 
 @dataclass
@@ -254,12 +260,49 @@ def _notes(give, get, partner_name) -> List[str]:
     return notes
 
 
-def classify(their_gain: float, give_value: float, get_value: float) -> str:
+def replacement_levels(snapshot: "LeagueSnapshot") -> Dict[str, float]:
+    """Points/game of the last starter at each position league-wide (what a waiver pickup roughly gives you)"""
+    slots_per_team: Dict[str, float] = {}
+    for _, eligible in snapshot.slots:
+        for pos in eligible:
+            slots_per_team[pos] = slots_per_team.get(pos, 0.0) + 1 / len(eligible)
+    levels = {}
+    for pos, per_team in slots_per_team.items():
+        bases = sorted(
+            (p.base for t in snapshot.teams.values() for p in t.players if p.position == pos),
+            reverse=True,
+        )
+        cutoff = round(per_team * len(snapshot.teams))
+        levels[pos] = bases[cutoff - 1] if 0 < cutoff <= len(bases) else 0.0
+    return levels
+
+
+def trade_values(snapshot: "LeagueSnapshot") -> Dict[int, float]:
+    """How an owner would value each player in a trade: points over replacement, stars weighted up.
+
+    Ignores byes and matchups (owners don't discount a player for a bye), and only discounts
+    serious injuries. This is separate from the lineup value used to measure the gain.
+    """
+    levels = replacement_levels(snapshot)
+    values = {}
+    for team in snapshot.teams.values():
+        for p in team.players:
+            over = max(0.0, p.base - levels.get(p.position, 0.0))
+            values[id(p)] = (over ** VALUE_EXPONENT) * TRADE_INJURY_DISCOUNT.get(p.injury, 1.0)
+    return values
+
+
+def classify(my_gain: float, their_gain: float, give_value: float, get_value: float) -> str:
     """How likely the other team is to say yes"""
-    ratio = min(give_value, get_value) / max(give_value, get_value) if max(give_value, get_value) else 0
-    if their_gain >= MIN_THEIR_GAIN and ratio >= MIN_VALUE_RATIO:
+    top = max(give_value, get_value)
+    ratio = min(give_value, get_value) / top if top else 0
+    if (
+        their_gain >= MIN_THEIR_GAIN
+        and their_gain >= MIN_GAIN_BALANCE * my_gain
+        and ratio >= MIN_VALUE_RATIO
+    ):
         return "Win-win"
-    if their_gain >= 0 or give_value >= get_value:
+    if (their_gain >= 0 and ratio >= SHOT_VALUE_RATIO) or (give_value >= get_value and their_gain >= 0):
         return "Worth a shot"
     return "Long shot"
 
@@ -283,6 +326,7 @@ def find_trades(
     min_ratio = CREATIVE_MIN_VALUE_RATIO if creative else MIN_VALUE_RATIO
     combos = [(1, 1), (2, 1), (1, 2)] + (CREATIVE_COMBOS if creative else [])
     focus = set(focus_positions or [])
+    tv = trade_values(snapshot)
     n = len(snapshot.weeks)
     slots = snapshot.slots
     me = snapshot.teams.get(my_team_id)
@@ -309,8 +353,8 @@ def find_trades(
         for give_n, get_n in combos:
             for give in combinations(my_pool, give_n):
                 for get in combinations(their_pool, get_n):
-                    give_value = sum(p.avg for p in give)
-                    get_value = sum(p.avg for p in get)
+                    give_value = sum(tv[id(p)] for p in give)
+                    get_value = sum(tv[id(p)] for p in get)
                     if not max(give_value, get_value) or (
                         min(give_value, get_value) / max(give_value, get_value) < min_ratio
                     ):
@@ -349,7 +393,9 @@ def find_trades(
                         my_gain=my_gain,
                         their_gain=their_gain,
                         notes=_notes(list(give), list(get), other.name),
-                        tier=classify(their_gain, give_value, get_value),
+                        tier=classify(my_gain, their_gain, give_value, get_value),
+                        give_value=give_value,
+                        get_value=get_value,
                     ))
 
         found.sort(key=lambda t: t.rank_key)
