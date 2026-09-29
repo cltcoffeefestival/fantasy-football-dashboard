@@ -31,7 +31,7 @@ def load_css():
 
 load_css()
 
-@st.cache_resource
+@st.cache_resource(ttl=900, show_spinner="Loading leagues from ESPN...")
 def load_league_data():
     """Load league data with caching"""
     try:
@@ -40,6 +40,12 @@ def load_league_data():
     except Exception as e:
         st.error(f"Error loading leagues: {e}")
         return None
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def cached_free_agents(_lm, league_name, limit):
+    """Free agent lookups hit ESPN every call, so cache them briefly"""
+    return _lm.get_free_agents(league_name, limit=limit)
 
 
 def record_class(wins, losses):
@@ -58,9 +64,11 @@ def record_class(wins, losses):
 def render_team_card(team):
     """One team card: rank, record, points"""
     wins, losses = int(team["Wins"]), int(team["Losses"])
+    you_badge = '<span class="rank-badge">YOU</span>' if team.get("Mine") else ""
     with st.container(border=True):
         st.markdown(
-            f'<div class="team-card-name">{html.escape(str(team["Team"]))}</div>'
+            f'<div class="team-card-name">{html.escape(str(team["Team"]))}'
+            f' {you_badge}</div>'
             f'<div class="team-card-record {record_class(wins, losses)}">{wins}-{losses}</div>'
             f'<div class="team-card-meta">'
             f'<span class="rank-badge">#{int(team["Standing"])}</span>'
@@ -133,6 +141,29 @@ def main():
         ],
     )
 
+    # Shared league / team picker (set once, used by every page)
+    for name, err in league_manager.load_errors.items():
+        st.sidebar.warning(f"Could not load **{name}**: {err}")
+
+    st.sidebar.divider()
+    league_name = st.sidebar.selectbox("League", list(league_manager.leagues.keys()))
+    league = league_manager.leagues[league_name]
+    team_options = {team.team_name: team.team_id for team in league.teams}
+    my_names = [t.team_name for t in league.teams if league_manager.is_my_team(t)]
+    default_idx = list(team_options).index(my_names[0]) if my_names else 0
+    selected_team = st.sidebar.selectbox(
+        "Your team", list(team_options.keys()), index=default_idx, key=f"team_{league_name}"
+    )
+    team_id = team_options[selected_team]
+    if not my_names:
+        st.sidebar.caption("Couldn't match your SWID to a team; pick yours above.")
+
+    st.sidebar.divider()
+    if st.sidebar.button("🔄 Refresh data", width="stretch"):
+        st.cache_resource.clear()
+        st.cache_data.clear()
+        st.rerun()
+
     # Page: Dashboard / Overview
     if page == "🏠 Dashboard":
         all_teams = league_manager.get_user_teams()
@@ -140,10 +171,16 @@ def main():
         if all_teams.empty:
             st.warning("No team data available")
         else:
+            only_mine = False
+            if all_teams["Mine"].any():
+                only_mine = st.toggle("Show only my teams", value=True)
+                if only_mine:
+                    all_teams = all_teams[all_teams["Mine"]]
+
             col1, col2, col3, col4 = st.columns(4)
             with col1:
                 with st.container(border=True):
-                    st.metric("Leagues", len(league_manager.leagues))
+                    st.metric("Leagues", all_teams["League"].nunique())
             with col2:
                 with st.container(border=True):
                     st.metric("Teams", len(all_teams))
@@ -171,17 +208,6 @@ def main():
     # Page: My Teams
     elif page == "👥 My Teams":
         st.header("👥 My Teams")
-
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-        )
-
-        league = league_manager.leagues[league_name]
-        team_options = {team.team_name: team.team_id for team in league.teams}
-
-        selected_team = st.selectbox("Select your team:", list(team_options.keys()))
-        team_id = team_options[selected_team]
 
         # Team Summary
         summary = analyzer.get_team_summary(league_name, team_id)
@@ -223,27 +249,11 @@ def main():
     elif page == "📊 Waiver Wire":
         st.header("📋 Waiver Wire & Free Agents")
 
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-            key="waiver_league",
-        )
-
-        league = league_manager.leagues[league_name]
-        team_options = {team.team_name: team.team_id for team in league.teams}
-
-        col1, col2 = st.columns([3, 1])
-        with col1:
-            selected_team = st.selectbox(
-                "Select your team:", list(team_options.keys()), key="waiver_team"
-            )
-            team_id = team_options[selected_team]
-        with col2:
-            limit = st.number_input("Top N free agents:", value=50, min_value=10)
+        limit = st.number_input("Free agents to consider:", value=50, min_value=10, step=10)
 
         # Recommended pickups
         st.subheader("🎯 Recommended Pickups by Position")
-        recommendations = analyzer.recommend_waiver_pickups(league_name, team_id, top_n=6)
+        recommendations = analyzer.recommend_waiver_pickups(league_name, team_id, pool_size=limit)
         if not recommendations.empty:
             cols = st.columns(3)
             for idx, (_, rec) in enumerate(recommendations.iterrows()):
@@ -262,7 +272,7 @@ def main():
         # All free agents
         st.markdown("---")
         st.subheader("📊 All Available Free Agents")
-        free_agents = league_manager.get_free_agents(league_name, limit=limit)
+        free_agents = cached_free_agents(league_manager, league_name, limit)
         if not free_agents.empty:
             free_agents_sorted = free_agents.sort_values("Avg Points", ascending=False)
 
@@ -286,20 +296,6 @@ def main():
     # Page: Team Analysis
     elif page == "🤝 Team Analysis":
         st.header("🔍 Team Analysis")
-
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-            key="analysis_league",
-        )
-
-        league = league_manager.leagues[league_name]
-        team_options = {team.team_name: team.team_id for team in league.teams}
-
-        selected_team = st.selectbox(
-            "Select your team:", list(team_options.keys()), key="analysis_team"
-        )
-        team_id = team_options[selected_team]
 
         col1, col2 = st.columns(2)
 
@@ -338,12 +334,6 @@ def main():
     # Page: League Standings
     elif page == "🏆 Standings":
         st.header("🏆 League Standings")
-
-        league_name = st.selectbox(
-            "Select a league:",
-            list(league_manager.leagues.keys()),
-            key="standings_league",
-        )
 
         standings = league_manager.get_league_standings(league_name)
         if not standings.empty:
