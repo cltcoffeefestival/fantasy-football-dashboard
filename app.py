@@ -7,6 +7,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
+from trade_finder import build_league_snapshot, find_trades, needs_table, WEEKS_AHEAD
 from config import LEAGUES
 import logging
 from pathlib import Path
@@ -46,6 +47,20 @@ def load_league_data():
 def cached_free_agents(_lm, league_name, limit):
     """Free agent lookups hit ESPN every call, so cache them briefly"""
     return _lm.get_free_agents(league_name, limit=limit)
+
+
+@st.cache_data(ttl=300, show_spinner="Scanning rosters, injuries and schedules...")
+def cached_snapshot(_lm, league_name, weeks_ahead):
+    """Player values for every roster in a league (one ESPN call per upcoming week)"""
+    return build_league_snapshot(_lm.leagues[league_name], weeks_ahead)
+
+
+def format_players(players):
+    parts = []
+    for p in players:
+        flag = f" ⚠️ {p.injury.replace('_', ' ').title()}" if p.injured else ""
+        parts.append(f"**{p.name}** ({p.position}, {p.avg:.1f} pts/wk){flag}")
+    return " + ".join(parts)
 
 
 def record_class(wins, losses):
@@ -136,6 +151,7 @@ def main():
             "🏠 Dashboard",
             "👥 My Teams",
             "📊 Waiver Wire",
+            "🔁 Trade Finder",
             "🤝 Team Analysis",
             "🏆 Standings",
         ],
@@ -231,7 +247,7 @@ def main():
 
         if not roster.empty:
             # Group by position
-            positions = ["QB", "RB", "WR", "TE", "DEF", "K"]
+            positions = ["QB", "RB", "WR", "TE", "D/ST", "K"]
 
             for position in positions:
                 pos_roster = roster[roster['Position'] == position]
@@ -293,43 +309,66 @@ def main():
         else:
             st.warning("No free agents found")
 
+    # Page: Trade Finder
+    elif page == "🔁 Trade Finder":
+        st.header("🔁 Trade Finder")
+        st.caption(
+            "Scans every roster in your league and suggests trades that improve your lineup, "
+            "help the other team enough that they'd say yes, and are roughly even in value. "
+            "Values account for projections, injuries, byes and upcoming matchups."
+        )
+
+        c1, c2 = st.columns(2)
+        with c1:
+            weeks_ahead = st.slider("Weeks to look ahead", 1, 6, WEEKS_AHEAD)
+        with c2:
+            min_gain = st.slider("Minimum gain for you (pts/week)", 0.5, 5.0, 1.0, 0.5)
+
+        snapshot = cached_snapshot(league_manager, league_name, weeks_ahead)
+        if team_id not in snapshot.teams:
+            st.warning("Team not found in league data")
+        else:
+            st.caption(
+                f"Weeks {snapshot.weeks[0]}–{snapshot.weeks[-1]} · "
+                + ("matchup difficulty included" if snapshot.schedule_adjusted
+                   else "⚠️ matchup ratings unavailable, using byes and injuries only")
+            )
+
+            st.subheader("Your roster by position")
+            st.dataframe(needs_table(snapshot.teams, snapshot.slots, team_id), width="stretch", hide_index=True)
+
+            st.subheader("Recommended trades")
+            trades = find_trades(snapshot, team_id, min_gain=min_gain)
+            if not trades:
+                st.info("No trades clear the bar right now. Try lowering the minimum gain or looking further ahead.")
+            for t in trades:
+                with st.container(border=True):
+                    st.markdown(f"**Trade with {t.partner_name}**")
+                    st.markdown(f"You give: {format_players(t.give)}")
+                    st.markdown(f"You get: {format_players(t.get)}")
+                    m1, m2 = st.columns(2)
+                    m1.metric("Your lineup", f"+{t.my_gain:.1f} pts/wk")
+                    m2.metric(f"{t.partner_name} lineup", f"+{t.their_gain:.1f} pts/wk")
+                    for note in t.notes:
+                        st.caption(f"⚠️ {note}")
+
     # Page: Team Analysis
     elif page == "🤝 Team Analysis":
         st.header("🔍 Team Analysis")
 
-        col1, col2 = st.columns(2)
-
-        with col1:
-            st.subheader("🤝 Potential Trade Partners")
-            trades = analyzer.find_trade_opportunities(league_name, team_id)
-            if trades.get("trade_partners"):
-                partners_df = pd.DataFrame(trades["trade_partners"])
-
-                # Color code by standing
-                st.dataframe(
-                    partners_df,
-                    width="stretch",
-                    hide_index=True,
-                )
-
-                st.info("💡 Trade partners are ranked by closeness in record")
-            else:
-                st.info("No close matches for trading right now")
-
-        with col2:
-            st.subheader("📊 Team Summary")
-            summary = analyzer.get_team_summary(league_name, team_id)
-            if summary:
-                st.markdown(f"""
-                <div class="stat-box">
-                    <p><strong>Team:</strong> {summary['Team']}</p>
-                    <p><strong>Record:</strong> {summary['Record']}</p>
-                    <p><strong>Points For:</strong> {summary['Points For']:.1f}</p>
-                    <p><strong>Points Against:</strong> {summary['Points Against']:.1f}</p>
-                    <p><strong>PPW:</strong> {summary['PPW']:.1f}</p>
-                    <p><strong>Roster Size:</strong> {summary['Roster Count']}</p>
-                </div>
-                """, unsafe_allow_html=True)
+        st.subheader("📊 Team Summary")
+        summary = analyzer.get_team_summary(league_name, team_id)
+        if summary:
+            st.markdown(f"""
+            <div class="stat-box">
+                <p><strong>Team:</strong> {summary['Team']}</p>
+                <p><strong>Record:</strong> {summary['Record']}</p>
+                <p><strong>Points For:</strong> {summary['Points For']:.1f}</p>
+                <p><strong>Points Against:</strong> {summary['Points Against']:.1f}</p>
+                <p><strong>PPW:</strong> {summary['PPW']:.1f}</p>
+                <p><strong>Roster Size:</strong> {summary['Roster Count']}</p>
+            </div>
+            """, unsafe_allow_html=True)
 
     # Page: League Standings
     elif page == "🏆 Standings":

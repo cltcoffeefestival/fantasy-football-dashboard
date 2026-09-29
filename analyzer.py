@@ -26,7 +26,7 @@ class TeamAnalyzer:
 
             # Get best available by position
             recommendations = []
-            for position in ["QB", "RB", "WR", "TE", "DEF", "K"]:
+            for position in ["QB", "RB", "WR", "TE", "D/ST", "K"]:
                 position_agents = free_agents[free_agents["Position"] == position]
                 if not position_agents.empty:
                     # Sort by avg points first, then projected
@@ -59,47 +59,6 @@ class TeamAnalyzer:
         except Exception as e:
             logger.error(f"Error analyzing strength of schedule: {e}")
             return pd.DataFrame()
-
-    def find_trade_opportunities(
-        self, league_name: str, team_id: int
-    ) -> Dict[str, List[Dict]]:
-        """Find potential trade partners based on roster strength"""
-        try:
-            league = self.league_manager.leagues.get(league_name)
-            if not league:
-                return {"trade_partners": []}
-
-            my_team = next((t for t in league.teams if t.team_id == team_id), None)
-            my_roster = self.league_manager.get_team_roster(league_name, team_id)
-
-            if my_team is None or my_roster.empty:
-                return {"trade_partners": []}
-
-            # Simple trade opportunity finder: teams close in standings
-            trade_partners = []
-            for opponent in league.teams:
-                if opponent.team_id == team_id:
-                    continue
-
-                # Find teams with complementary records
-                trade_match = {
-                    "Team": opponent.team_name,
-                    "Record": f"{opponent.wins}-{opponent.losses}",
-                    "Points For": round(opponent.points_for, 1),
-                    "Standing": opponent.standing,
-                }
-                trade_partners.append(trade_match)
-
-            # Sort by closeness in record
-            trade_partners.sort(
-                key=lambda x: abs((my_team.wins - int(x["Record"].split("-")[0])))
-            )
-
-            return {"trade_partners": trade_partners[:5]}  # Top 5 closest teams
-
-        except Exception as e:
-            logger.error(f"Error finding trade opportunities: {e}")
-            return {"trade_partners": []}
 
     def get_injury_report(self, league_name: str) -> pd.DataFrame:
         """Get injury report - simplified version"""
