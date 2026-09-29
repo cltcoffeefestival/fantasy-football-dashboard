@@ -34,9 +34,8 @@ wheels/
 *~
 .DS_Store
 
-# Streamlit
-.streamlit/
-*.streamlit.app
+# Streamlit - Secrets
+.streamlit/secrets.toml
 
 # Environment variables
 .env
