@@ -50,6 +50,7 @@ MIN_GAIN_BALANCE = 0.35  # their lineup gain must be at least this share of your
 MIN_VALUE_RATIO = 0.85   # trade value given vs. received must be within ~15%
 SHOT_VALUE_RATIO = 0.7   # "worth a shot" trades can be a bit further apart
 VALUE_EXPONENT = 1.5     # stars are worth more than the sum of two mid players
+STAR_PREMIUM = 1.15      # extra weight on the single most valuable player on each side
 TRADE_INJURY_DISCOUNT = {"DOUBTFUL": 0.95, "OUT": 0.7, "SUSPENSION": 0.8, "INJURY_RESERVE": 0.5}
 # Creative mode loosens the partner-side filters so longer shots and bigger packages show up
 CREATIVE_MIN_THEIR_GAIN = -1.5
@@ -246,18 +247,24 @@ def needs_table(teams: Dict[int, TeamSnapshot], slots, team_id: int) -> List[Dic
 
 # --------------------------------------------------------------------- trades
 
-def _notes(give, get, partner_name) -> List[str]:
+def _notes(give, get, partner_name, my_drop=(), their_drop=()) -> List[str]:
     notes = []
     for p in give + get:
         if p.injured:
             notes.append(f"{p.name} is {p.injury.replace('_', ' ').title()}")
         if p.weekly and p.weekly.count(0.0) and not p.injured:
             notes.append(f"{p.name} has a bye in the window")
-    if len(give) > len(get):
-        notes.append(f"{partner_name} would need to drop {len(give) - len(get)} player(s)")
-    elif len(get) > len(give):
-        notes.append(f"You would need to drop {len(get) - len(give)} player(s)")
+    if my_drop:
+        notes.append("You would drop " + ", ".join(p.name for p in my_drop))
+    if their_drop:
+        notes.append(f"{partner_name} would drop " + ", ".join(p.name for p in their_drop))
     return notes
+
+
+def side_value(players, tv: Dict[int, float]) -> float:
+    """Total trade value of a group of players, with a premium on the best one"""
+    values = [tv[id(p)] for p in players]
+    return sum(values) + (STAR_PREMIUM - 1) * max(values, default=0.0)
 
 
 def replacement_levels(snapshot: "LeagueSnapshot") -> Dict[str, float]:
@@ -336,7 +343,11 @@ def find_trades(
     def useful(players):
         return sorted((p for p in players if p.avg > 0), key=lambda p: p.avg, reverse=True)[:POOL_SIZE]
 
+    def by_value(players):
+        return sorted(players, key=lambda p: (tv[id(p)], p.avg))
+
     my_pool = useful(me.players)
+    my_cheapest = by_value(me.players)
     my_before = lineup_total(me.players, slots, n)
     proposals: List[TradeProposal] = []
 
@@ -345,6 +356,7 @@ def find_trades(
             continue
         their_pool = useful(other.players)
         their_before = lineup_total(other.players, slots, n)
+        their_cheapest = by_value(other.players)
         found: List[TradeProposal] = []
 
         # 1-for-1 gains, kept for every pair so multi-player swaps can be compared to them
@@ -353,16 +365,23 @@ def find_trades(
         for give_n, get_n in combos:
             for give in combinations(my_pool, give_n):
                 for get in combinations(their_pool, get_n):
-                    give_value = sum(tv[id(p)] for p in give)
-                    get_value = sum(tv[id(p)] for p in get)
+                    give_ids = {id(p) for p in give}
+                    get_ids = {id(p) for p in get}
+
+                    # whoever ends up with extra players must cut the cheapest ones
+                    my_drop = [p for p in my_cheapest if id(p) not in give_ids][: max(0, get_n - give_n)]
+                    their_drop = [p for p in their_cheapest if id(p) not in get_ids][: max(0, give_n - get_n)]
+                    give_value = max(0.0, side_value(give, tv) - sum(tv[id(p)] for p in their_drop))
+                    get_value = max(0.0, side_value(get, tv) - sum(tv[id(p)] for p in my_drop))
                     if not max(give_value, get_value) or (
                         min(give_value, get_value) / max(give_value, get_value) < min_ratio
                     ):
                         continue
 
-                    give_ids = {id(p) for p in give}
-                    get_ids = {id(p) for p in get}
-                    my_after = [p for p in me.players if id(p) not in give_ids] + list(get)
+                    my_drop_ids = {id(p) for p in my_drop}
+                    my_after = [
+                        p for p in me.players if id(p) not in give_ids and id(p) not in my_drop_ids
+                    ] + list(get)
                     my_gain = (lineup_total(my_after, slots, n) - my_before) / n
 
                     if (give_n, get_n) == (1, 1):
@@ -380,7 +399,10 @@ def find_trades(
                     if focus and not any(p.position in focus for p in get):
                         continue
 
-                    their_after = [p for p in other.players if id(p) not in get_ids] + list(give)
+                    their_drop_ids = {id(p) for p in their_drop}
+                    their_after = [
+                        p for p in other.players if id(p) not in get_ids and id(p) not in their_drop_ids
+                    ] + list(give)
                     their_gain = (lineup_total(their_after, slots, n) - their_before) / n
                     if their_gain < min_their:
                         continue
@@ -392,7 +414,7 @@ def find_trades(
                         get=list(get),
                         my_gain=my_gain,
                         their_gain=their_gain,
-                        notes=_notes(list(give), list(get), other.name),
+                        notes=_notes(list(give), list(get), other.name, my_drop, their_drop),
                         tier=classify(my_gain, their_gain, give_value, get_value),
                         give_value=give_value,
                         get_value=get_value,
