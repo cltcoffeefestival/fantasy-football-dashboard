@@ -66,9 +66,11 @@ CREATIVE_COMBOS = [(2, 2), (3, 1), (1, 3)]
 POOL_SIZE = 8            # top players per side considered in a swap
 STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
 
-# Estimated waiver-wire replacement level (pts/wk) for a standard league. QB/RB/WR/TE are the
-# agreed baselines; D/ST and K are my additions. Tune these if your scoring differs.
-WAIVER_BASELINES = {"QB": 12.5, "RB": 7.0, "WR": 8.0, "TE": 5.5, "D/ST": 6.0, "K": 7.0}
+# Estimated waiver-wire replacement level (pts/wk) for a full-PPR league. A standard-scoring league
+# would be roughly QB 12.5, RB 7, WR 8, TE 5.5; PPR adds about a point per catch, which lifts
+# the pass-catching positions most. These are estimates: tune them to what your waiver wire
+# actually yields. D/ST and K don't change with PPR.
+WAIVER_BASELINES = {"QB": 13.0, "RB": 8.5, "WR": 9.5, "TE": 6.5, "D/ST": 6.0, "K": 7.0}
 SEASON_LAST_WEEK = 18
 
 
