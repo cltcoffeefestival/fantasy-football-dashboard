@@ -248,7 +248,7 @@ def test_qb_upgrades_count_half_for_the_target_in_one_qb_leagues():
 
 # ---- talent floor, candidate pools and replacement level
 
-from trade_finder import TALENT_FLOOR_RATIO, TALENT_GAP_RATE, fetch_drv  # noqa: E402
+from trade_finder import TALENT_FLOOR_RATIO, TALENT_GAP_RATE, explain, fetch_drv  # noqa: E402
 
 
 def test_talent_floor_penalizes_trading_a_clearly_better_player_for_a_lesser_one():
@@ -291,3 +291,39 @@ def test_replacement_level_averages_the_top_three_healthy_free_agents():
     pts["WR"] = [(30.0, "OUT"), (12.0, "ACTIVE"), (10.0, "ACTIVE"), (8.0, "ACTIVE"), (2.0, "ACTIVE")]
     drv, live = fetch_drv(_League(pts), 5)
     assert abs(drv["WR"] - 10.0) < 1e-9 and live
+
+
+# ---- effective structure and bench-level pieces (feedback on the Bowers+Corum and Kyler trades)
+
+def test_a_throw_in_below_waiver_level_does_not_count_as_a_player_in_the_structure():
+    # Bowers + Corum for Wilson + Montgomery: Corum wouldn't beat a waiver RB, so it's really 1-for-2
+    me = core("m", [P("Corum", "RB", 8.2)], te=16.2)
+    target = core("t", [P("Wilson", "WR", 13.3), P("Montgomery", "RB", 12.7)], te=11.8)
+    t = evaluate(snapshot(me, target), ["mTE", "Corum"], ["Wilson", "Montgomery"])
+    assert (len(t.send), len(t.receive)) == (2, 2)
+    assert (t.real_in, t.real_out) == (1, 2)
+    assert t.tsp == TSP_TARGET_RECEIVES_FEWER
+    assert "1-for-2" in explain(t)[1]
+
+
+def test_a_backup_qb_who_only_covers_a_bye_adds_nothing_for_the_target():
+    # target has a real QB1 (bye in week 2); the incoming 15.8 QB would start only that week
+    me = core("m", [P("Kyler", "QB", 15.8)])
+    target = core("t", [P("Waddle", "WR", 12.2)])
+    for p in target:
+        if p.name == "tQB":
+            p.weekly[:] = [20.0, 0.0, 20.0, 20.0]
+    t = evaluate(snapshot(me, target), ["Kyler"], ["Waddle"])
+    assert not t.theirs.upgrades
+    assert t.theirs.delta <= 1e-9          # they only lose Waddle; the backup QB contributes nothing
+
+
+def test_a_waiver_filled_slot_names_the_rostered_player_the_model_is_bypassing():
+    # their rostered QB (12.0) is below the waiver level (13.0), so the model assumes they'd stream:
+    # the explanation has to say so, instead of just "filled from waivers"
+    me = core("m", [P("Kyler", "QB", 16.0)])
+    target = core("t", [P("Waddle", "WR", 12.0)], qb=12.0)
+    t = evaluate(snapshot(me, target), ["Kyler"], ["Waddle"])
+    assert t.theirs.upgrades and t.theirs.upgrades[0][1] is None
+    them_why = explain(t)[1]
+    assert "tQB" in them_why and "waivers" in them_why

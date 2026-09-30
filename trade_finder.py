@@ -73,6 +73,7 @@ PLT_QB_TE_RATE = 0.5              # lost QB1/TE1: the lineup change already char
 TALENT_FLOOR_RATIO = 0.85         # the best player the target gets should be within 15% of its best player out
 TALENT_GAP_RATE = 0.5             # PPG penalty per PPG of talent gap beyond that
 TALENT_GAP_HOLE_RATE = 0.25       # gentler when a different position's real hole is being filled
+REAL_MARGIN = 1.0                 # a player must beat the waiver pickup by this much to count as a real piece
 DRV_TOP_N = 3                     # replacement level = average of the best few free agents, not the single best
 NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
 QB_GAIN_HAIRCUT = 0.5             # owners discount QB upgrades in 1QB leagues: waiver QBs are plentiful
@@ -140,6 +141,7 @@ class SideImpact:
     drops: List[PlayerValue] = field(default_factory=list)       # bench players cut to make room
     lost_starters: List[PlayerValue] = field(default_factory=list)
     redundant: List[PlayerValue] = field(default_factory=list)   # incoming players that add nothing
+    slot_notes: Dict[int, str] = field(default_factory=dict)     # id(incoming) -> why a slot counts as waiver-filled
     solves_hole: bool = False                                    # fills a weak slot / weak position
     blocked: bool = False                                        # gives up starters for a redundant bench piece
 
@@ -159,6 +161,9 @@ class TradeProposal:
     ap: float = 0.0
     lat: float = 0.0
     tfl: float = 0.0
+    real_in_players: List[PlayerValue] = field(default_factory=list)   # players the target receives who beat waivers
+    real_in: int = 0                 # ... and how many
+    real_out: int = 0                # players the target gives who are starters or beat one
     alpha_assets: List[PlayerValue] = field(default_factory=list)
     tier: Optional[str] = None
     notes: List[str] = field(default_factory=list)
@@ -322,13 +327,18 @@ def lineup_ppg(players: List[PlayerValue], ctx, n_weeks: int) -> float:
     return sum(_solve_week(players, ctx, w)[0] for w in range(n_weeks)) / n_weeks
 
 
-def starter_ids(players: List[PlayerValue], ctx, n_weeks: int) -> set:
-    """Players in the optimal lineup for at least half of the window"""
+def start_counts(players: List[PlayerValue], ctx, n_weeks: int) -> Dict[int, int]:
+    """How many weeks of the window each player is in the optimal lineup"""
     counts: Dict[int, int] = {}
     for w in range(n_weeks):
         for p in _solve_week(players, ctx, w)[1]:
             counts[id(p)] = counts.get(id(p), 0) + 1
-    return {pid for pid, c in counts.items() if c * 2 >= n_weeks}
+    return counts
+
+
+def starter_ids(players: List[PlayerValue], ctx, n_weeks: int) -> set:
+    """Players in the optimal lineup for at least half of the window"""
+    return {pid for pid, c in start_counts(players, ctx, n_weeks).items() if c * 2 >= n_weeks}
 
 
 def position_strengths(teams: Dict[int, TeamSnapshot], slots) -> Dict[int, Dict[str, float]]:
@@ -387,9 +397,14 @@ def s_tier_ids(snapshot: LeagueSnapshot) -> set:
 
 
 def structure_penalty(received: int, sent: int) -> float:
-    """TSP from the target's view: it receives `received` players and sends `sent`"""
+    """TSP from the target's view: it receives `received` real players and sends `sent`.
+
+    Callers pass EFFECTIVE counts: a player who doesn't beat a waiver pickup isn't a real piece.
+    """
+    if sent == 0:
+        return 0.0
     if received == sent:
-        return 0.0 if received == 1 else TSP_TWO_FOR_TWO
+        return 0.0 if received <= 1 else TSP_TWO_FOR_TWO
     return TSP_TARGET_RECEIVES_MORE if received > sent else TSP_TARGET_RECEIVES_FEWER
 
 
@@ -446,14 +461,25 @@ class TradeContext:
             p.position for p in side.team.players
             if id(p) in side.starters and id(p) in self.s_tier and id(p) not in out_ids
         }
-        # 1QB / 1TE: a second QB/TE behind a top-tier QB1/TE1 contributes nothing
-        excluded = [p for p in incoming if p.position in self.single and p.position in staying_elite]
-        excluded_ids = {id(p) for p in excluded}
-
-        roster = [
-            p for p in side.team.players if id(p) not in out_ids and id(p) not in drop_ids
-        ] + [p for p in incoming if id(p) not in excluded_ids]
-        # excluded players are still rostered (bench), they just can't start
+        # Incoming players that add nothing an owner could not get from waivers contribute 0:
+        #  - 1QB / 1TE: a second QB/TE behind a top-tier QB1/TE1
+        #  - anyone who doesn't clearly beat the waiver pickup at his position
+        excluded_ids = {
+            id(p) for p in incoming
+            if (p.position in self.single and p.position in staying_elite)
+            or value_over_replacement(p, self.drv) < REAL_MARGIN
+        }
+        base_roster = [p for p in side.team.players if id(p) not in out_ids and id(p) not in drop_ids]
+        roster = base_roster + [p for p in incoming if id(p) not in excluded_ids]
+        # a backup who only starts to cover a bye or an injury adds nothing either: a waiver
+        # pickup does the same job. Only players who start nearly every week count.
+        full_time = max(1, self.n - 1)
+        counts = start_counts(roster, self.ctx, self.n)
+        part_time = {id(p) for p in incoming if id(p) not in excluded_ids and counts.get(id(p), 0) < full_time}
+        if part_time:
+            excluded_ids |= part_time
+            roster = base_roster + [p for p in incoming if id(p) not in excluded_ids]
+        # excluded players are still on the roster (bench), they just can't start
         delta = lineup_ppg(roster, self.ctx, self.n) - side.before
         perceived = delta
         if "QB" in self.single:
@@ -471,7 +497,21 @@ class TradeContext:
             for _, displaced, _ in upgrades
         ) or any(p.position in weak_positions for p in incoming_starters)
 
+        slot_notes = {}
+        for p, displaced, _ in upgrades:
+            if displaced is None:
+                best = max(
+                    (q for q in side.team.players if q.position == p.position and id(q) not in out_ids),
+                    key=lambda q: q.base, default=None,
+                )
+                waiver = self.drv.get(p.position, 0.0)
+                slot_notes[id(p)] = (
+                    f"the model fills that slot from waivers ({waiver:.1f} PPG); their best rostered "
+                    f"{p.position} is {best.name} ({best.base:.1f})" if best is not None
+                    else f"they have no rostered {p.position}, so the model fills it from waivers ({waiver:.1f} PPG)"
+                )
         return SideImpact(
+            slot_notes=slot_notes,
             delta=delta,
             perceived=perceived,
             upgrades=upgrades,
@@ -512,7 +552,13 @@ class TradeContext:
         if len(send) > len(receive):
             tap *= TAP_PACKAGE_MULT      # a depth package for a star is the classic rejection
         bcp = BCP_RATE * sum(value_over_replacement(p, self.drv) for p in theirs.drops) if len(send) >= 2 else 0.0
-        tsp = structure_penalty(len(send), len(receive))
+        # structure is judged on real pieces: a bench-level player is a throw-in, not a player
+        real_in = [p for p in send if value_over_replacement(p, self.drv) >= REAL_MARGIN]
+        real_out = [
+            p for p in receive
+            if value_over_replacement(p, self.drv) >= REAL_MARGIN or id(p) in self.theirs.starters
+        ]
+        tsp = structure_penalty(len(real_in), len(real_out))
 
         # Positional Loss Tax: the target surrenders a starter it can't replace from what comes back
         plt = 0.0
@@ -553,7 +599,7 @@ class TradeContext:
             receive=list(receive),
             mine=mine,
             theirs=theirs,
-            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl,
+            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl, real_in=len(real_in), real_out=len(real_out), real_in_players=real_in,
             alpha_assets=alpha,
             notes=_notes(send, receive),
         )
@@ -668,7 +714,7 @@ def _upgrade_text(side: SideImpact) -> str:
     for p, displaced, gain in side.upgrades:
         over = (
             f"over {displaced.name} ({displaced.base:.1f})"
-            if displaced else "in a slot that would otherwise be filled from waivers"
+            if displaced else f"in a slot where {side.slot_notes.get(id(p), 'a waiver pickup would otherwise play')}"
         )
         parts.append(f"{p.name} ({p.base:.1f} PPG) starts at {p.position} {over}, +{gain:.1f} PPG")
     return "; ".join(parts)
@@ -700,6 +746,12 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         them.append(_upgrade_text(t.theirs))
     else:
         them.append(f"their lineup changes by {t.theirs.delta:+.1f} PPG")
+    if t.real_in != len(t.send) or t.real_out != len(t.receive):
+        throw_ins = [p.name for p in t.send if p.name not in {q.name for q in t.real_in_players}]
+        them.append(
+            f"judged on real pieces it's a {t.real_in}-for-{t.real_out} for them"
+            + (f" ({', '.join(throw_ins)} wouldn't beat a waiver pickup)" if throw_ins else "")
+        )
     if t.penalties:
         friction = ", ".join(f"{PENALTY_LABELS[name]} -{value:.1f}" for name, value in t.penalties)
         them.append(f"friction they'll feel: {friction}")

@@ -87,7 +87,10 @@ def render_proposal(t, why_label=None):
             "**Impact Breakdown**\n"
             f"- **Your Team:** net starting gain **{t.my_gain:+.1f} PPG** · positions fixed: {fixed} · displaced: {displaced}\n"
             f"- **Target Team:** MAI **{t.mai:+.1f} PPG** · net lineup Δ {t.delta_lineup:+.1f} PPG · "
-            f"friction penalties: {friction}\n"
+            f"friction penalties: {friction}"
+            + (f" · structure judged as {t.real_in}-for-{t.real_out} on real pieces"
+               if (t.real_in, t.real_out) != (len(t.send), len(t.receive)) else "")
+            + "\n"
             f"- **Net Mutual Utility:** {t.nmu:+.1f} PPG"
         )
         st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {t.you_why}\n- **Why it works for them:** {t.them_why}")
