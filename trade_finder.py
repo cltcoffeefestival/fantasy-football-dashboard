@@ -661,12 +661,34 @@ class TradeContext:
         return None
 
 
+def blocked_reason(t: TradeProposal) -> str:
+    """Which side would be giving up a starter for a bench piece at a position it's already elite at"""
+    parts = []
+    for whose, side in (("You", t.mine), ("They", t.theirs)):
+        if not side.blocked:
+            continue
+        gives = " + ".join(p.name for p in side.lost_starters)
+        gets = " + ".join(p.name for p in side.redundant)
+        pos = "/".join(sorted({p.position for p in side.redundant}))
+        verb = "You'd" if whose == "You" else "They'd"
+        own = "you already have" if whose == "You" else "they already have"
+        outcome = (
+            "so this doesn't improve your team." if whose == "You"
+            else "so they have no reason to accept."
+        )
+        parts.append(
+            f"Blocked: {verb} give up starter {gives} for bench piece {gets} at {pos}, "
+            f"where {own} an elite starter, {outcome}"
+        )
+    return " ".join(parts)
+
+
 def why_no_tier(t: TradeProposal) -> str:
     """Which bar a trade misses, in plain words (empty when it does clear a tier)"""
     if t.tier is not None:
         return ""
     if t.blocked:
-        return "Blocked: it gives up a starter for a bench piece at a position where you're already elite."
+        return blocked_reason(t)
     if t.theirs.delta < 0:
         return f"Their lineup gets worse ({t.theirs.delta:+.1f} PPG), so they have no reason to accept."
     if t.mine.delta <= 0:

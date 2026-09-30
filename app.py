@@ -485,8 +485,6 @@ def main():
                     [p for p in mine if p.name in send_names],
                     [p for p in theirs if p.name in recv_names],
                 )
-                if t.blocked:
-                    st.warning("Blocked: this gives up starting depth for a redundant bench piece where you're already elite.")
                 icon = TIER_STYLE[t.tier][0] if t.tier else "⛔"
                 st.markdown(f"{icon} **{t.tier or 'Does not clear any tier'}**")
                 if not t.tier:
