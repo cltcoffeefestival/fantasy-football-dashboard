@@ -1,21 +1,23 @@
 """
-Trade Finder - finds trades that improve your lineup and are plausible for the other team.
+Trade engine (HATE-G): Human Acceptance Trade Engine & Generator.
 
-How it works
-1. Each player gets a weekly value for the next N weeks:
-   blend of season average and projection, x opponent matchup, x injury availability,
-   and 0 on bye weeks.
-2. Each team's best lineup is built from the league's real lineup slots (incl. flex). Any slot
-   a rostered player can't beat (bye, injury, empty) is filled by a waiver-wire baseline, so
-   bench players only count for what they add over a free pickup.
-3. Candidate swaps with every other team are scored by the net change in weekly starting
-   points (optimal lineup before vs. after) for BOTH teams. A trade is only suggested when it
-   helps you meaningfully, helps them at least a little, and is roughly even in value.
-4. Each player also gets an effective value (get_effective_value): starters count at their full
-   projected average; bench players only for the bye weeks they cover, amortized over the season.
+Every trade is scored from the TARGET manager's perspective with the Manager Acceptance Index:
+
+    MAI = dLineup - TAP - BCP - TSP - AP
+
+    dLineup  net change in the target's optimal starting lineup (PPG). A slot a rostered player
+             can't beat (bye, injury, empty) is filled by the top waiver pickup at that position
+             (Dynamic Replacement Value, DRV), so incoming players only count for what they add
+             over the starter they displace and lost starters are always charged.
+    TAP      Tier-1 Alpha Premium: 20% of the PPG of an S-tier asset the target surrenders.
+    BCP      Bench Clutter Penalty: half the value over replacement of each bench player the target
+             must cut when it receives more players than it sends.
+    TSP      Trade Structure Penalty: 1.5 when the target receives 2+ for 1, 1.0 for a 2-for-2.
+    AP       Asymmetry Penalty: 3.0 when the target surrenders 2 starters for 1 starter + 1 bench piece.
+
+Trades are grouped by MAI into three acceptance tiers (Win-Win / Worth a Shot / Long Shot).
 """
 from dataclasses import dataclass, field
-from functools import lru_cache
 from itertools import combinations
 from typing import Dict, List, Optional, Tuple
 import logging
@@ -23,6 +25,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 WEEKS_AHEAD = 4
+SEASON_LAST_WEEK = 18
 
 # Slot label -> player positions that may fill it
 FLEX_ELIGIBILITY = {
@@ -48,30 +51,27 @@ INJURY_AVAILABILITY = {
 MATCHUP_SWING = 0.12
 MATCHUP_POSITIONS = {"QB": "1", "RB": "2", "WR": "3", "TE": "4"}  # ESPN defaultPositionId
 
-# Trade filters
-MIN_MY_GAIN = 1.0        # pts/week
-MIN_THEIR_GAIN = 0.5     # pts/week: otherwise they have no reason to accept
-MIN_GAIN_BALANCE = 0.35  # their lineup gain must be at least this share of yours
-MIN_VALUE_RATIO = 0.85   # trade value given vs. received must be within ~15%
-SHOT_VALUE_RATIO = 0.7   # "worth a shot" trades can be a bit further apart
-VALUE_EXPONENT = 1.5     # stars are worth more than the sum of two mid players
-STAR_PREMIUM = 1.15      # extra weight on the single most valuable player on each side
-TRADE_INJURY_DISCOUNT = {"DOUBTFUL": 0.95, "OUT": 0.7, "SUSPENSION": 0.8, "INJURY_RESERVE": 0.5}
-# Creative mode loosens the partner-side filters so longer shots and bigger packages show up
-CREATIVE_MIN_THEIR_GAIN = -1.5
-CREATIVE_MIN_VALUE_RATIO = 0.4
-FALLBACK_MIN_THEIR_GAIN = -3.0
-FALLBACK_MIN_VALUE_RATIO = 0.3
-CREATIVE_COMBOS = [(2, 2), (3, 1), (1, 3)]
-POOL_SIZE = 8            # top players per side considered in a swap
-STRENGTH_MARGIN = 0.10   # +/-10% vs. league average starters => strength / weakness
+# ---- Manager Acceptance Index
+TAP_RATE = 0.20              # of the S-tier asset's PPG
+BCP_RATE = 0.5               # of the dropped bench player's value over replacement
+TSP_RECEIVES_MORE = 1.5      # target receives more players than it sends (e.g. 2-for-1)
+TSP_TWO_FOR_TWO = 1.0
+AP_PENALTY = 3.0
+# S-tier (Tier-1 Alpha) = top N rostered players at the position across the league
+S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}
 
-# Estimated waiver-wire replacement level (pts/wk) for a full-PPR league. A standard-scoring league
-# would be roughly QB 12.5, RB 7, WR 8, TE 5.5; PPR adds about a point per catch, which lifts
-# the pass-catching positions most. These are estimates: tune them to what your waiver wire
-# actually yields. D/ST and K don't change with PPR.
-WAIVER_BASELINES = {"QB": 13.0, "RB": 8.5, "WR": 9.5, "TE": 6.5, "D/ST": 6.0, "K": 7.0}
-SEASON_LAST_WEEK = 18
+WIN_WIN_MIN = 2.0
+WORTH_A_SHOT_MIN = 0.5
+LONG_SHOT_MIN = -1.5
+TIERS = ["Win-Win", "Worth a Shot", "Long Shot"]
+PER_TIER = 2
+POOL_SIZE = 8                # top players per side considered in a swap
+WEAK_SLOT_MARGIN = 3.0       # a starter within this many PPG of the waiver pickup is a weak slot
+MIN_MY_GAIN = 0.5            # a proposal must be worth sending: at least this much for you (PPG)
+STRENGTH_MARGIN = 0.10       # +/-10% vs. league average starters => strength / weakness
+
+# Used only when the free agent lookup fails: rough full-PPR waiver-wire PPG by position
+FALLBACK_DRV = {"QB": 13.0, "RB": 8.5, "WR": 9.5, "TE": 6.5, "D/ST": 6.0, "K": 7.0}
 
 
 @dataclass
@@ -82,7 +82,6 @@ class PlayerValue:
     injury: str
     base: float                # blended points per game
     weekly: List[float] = field(default_factory=list)
-    bye_weeks: List[int] = field(default_factory=list)   # remaining bye weeks this season
 
     @property
     def avg(self) -> float:
@@ -101,48 +100,38 @@ class TeamSnapshot:
     record: str = ""
 
 
-TIER_ORDER = ["Win-win", "Worth a shot", "Long shot"]
-
-
-@dataclass
-class TradeProposal:
-    partner_id: int
-    partner_name: str
-    give: List[PlayerValue]
-    get: List[PlayerValue]
-    my_gain: float
-    their_gain: float
-    notes: List[str]
-    tier: str = "Win-win"
-    give_value: float = 0.0
-    get_value: float = 0.0
-    # Net weekly lineup impact: optimal starting points per week before and after the trade
-    my_before: float = 0.0
-    my_after: float = 0.0
-    their_before: float = 0.0
-    their_after: float = 0.0
-    # (role, effective value) per player: my side's players in my lineup, theirs in theirs
-    give_info: List[Tuple[str, float]] = field(default_factory=list)
-    get_info: List[Tuple[str, float]] = field(default_factory=list)
-
-    @property
-    def rank_key(self) -> tuple:
-        """Likelier trades first, then biggest combined gain"""
-        return (TIER_ORDER.index(self.tier), -self.score)
-
-    @property
-    def score(self) -> float:
-        return self.my_gain + self.their_gain
-
-
 @dataclass
 class LeagueSnapshot:
     teams: Dict[int, TeamSnapshot]
     slots: List[Tuple[str, frozenset]]
     weeks: List[int]
     schedule_adjusted: bool
-    season_weeks_remaining: int = 1
-    analysis: Dict[int, Dict[int, Tuple[str, float]]] = field(default_factory=dict)
+    drv: Dict[str, float] = field(default_factory=lambda: dict(FALLBACK_DRV))
+    drv_live: bool = False     # True when DRV came from the league's actual free agents
+
+
+@dataclass
+class TradeProposal:
+    target_id: int
+    target_name: str
+    send: List[PlayerValue]          # what you send to the target
+    receive: List[PlayerValue]       # what the target sends you
+    mai: float
+    delta_lineup: float              # target's net lineup change (PPG)
+    tap: float
+    bcp: float
+    tsp: float
+    ap: float
+    my_gain: float                   # your net lineup change (PPG)
+    tier: Optional[str]
+    target_drops: List[PlayerValue] = field(default_factory=list)
+    my_drops: List[PlayerValue] = field(default_factory=list)
+    # (incoming player, starter he displaces or None for a waiver-filled slot, PPG gained at the slot)
+    upgrades: List[Tuple[PlayerValue, Optional[PlayerValue], float]] = field(default_factory=list)
+    alpha_assets: List[PlayerValue] = field(default_factory=list)
+    solves_deficiency: bool = False
+    notes: List[str] = field(default_factory=list)
+    why: str = ""
 
 
 # ---------------------------------------------------------------- player values
@@ -172,23 +161,7 @@ def matchup_factor(rank: Optional[int]) -> float:
     return 1 + MATCHUP_SWING * ((rank - 16.5) / 15.5)
 
 
-def remaining_byes(schedule: dict, current_week: int, last_week: int = SEASON_LAST_WEEK) -> List[int]:
-    """Weeks from now to season end with no game. Only trusts weeks the schedule actually covers."""
-    if not schedule:
-        return []
-    covered = max(int(w) for w in schedule)
-    return [
-        w for w in range(current_week, min(last_week, covered) + 1)
-        if not (schedule.get(str(w)) or schedule.get(w))
-    ]
-
-
-def build_player_value(
-    player,
-    weeks: List[int],
-    ratings: Dict[int, Dict[str, Dict[str, int]]],
-    current_week: Optional[int] = None,
-) -> PlayerValue:
+def build_player_value(player, weeks: List[int], ratings: Dict[int, Dict[str, Dict[str, int]]]) -> PlayerValue:
     """Turn an espn_api Player into a PlayerValue over the given weeks"""
     injury = (getattr(player, "injuryStatus", "") or "ACTIVE").upper()
     position = getattr(player, "position", "")
@@ -220,7 +193,6 @@ def build_player_value(
         injury=injury,
         base=base,
         weekly=weekly,
-        bye_weeks=remaining_byes(schedule, current_week or (weeks[0] if weeks else 1)),
     )
 
 
@@ -238,24 +210,22 @@ def build_slots(position_slot_counts: Dict[str, int]) -> List[Tuple[str, frozens
     return slots
 
 
-@lru_cache(maxsize=None)
-def _slot_waiver(eligible: frozenset) -> float:
-    """What a waiver pickup is worth in a slot: the best baseline among eligible positions"""
-    return max((WAIVER_BASELINES.get(pos, 0.0) for pos in eligible), default=0.0)
+def slot_context(slots, drv: Dict[str, float]) -> List[Tuple[frozenset, float]]:
+    """Each slot with the waiver pickup that would fill it (best DRV among eligible positions)"""
+    return [(eligible, max((drv.get(pos, 0.0) for pos in eligible), default=0.0)) for _, eligible in slots]
 
 
-def _solve_week(players: List[PlayerValue], slots, week: int):
+def _solve_week(players: List[PlayerValue], ctx, week: int):
     """Best lineup for one week. Returns (points, players who start).
 
     A slot goes to the best available rostered player, unless a waiver pickup would score more
-    (bye, injury, or an empty slot), in which case the slot is filled at the waiver baseline.
+    (bye, injury, or nobody eligible), in which case it is filled at the waiver value.
     """
     ranked = sorted(players, key=lambda p: p.weekly[week], reverse=True)
     used = set()
     total = 0.0
     starters = []
-    for _, eligible in slots:
-        waiver = _slot_waiver(eligible)
+    for eligible, waiver in ctx:
         for idx, p in enumerate(ranked):
             if idx not in used and p.position in eligible:
                 if p.weekly[week] >= waiver:
@@ -270,66 +240,18 @@ def _solve_week(players: List[PlayerValue], slots, week: int):
     return total, starters
 
 
-def lineup_total(players: List[PlayerValue], slots, n_weeks: int) -> float:
-    """Sum of the best possible lineup for each upcoming week"""
-    return sum(_solve_week(players, slots, w)[0] for w in range(n_weeks))
+def lineup_ppg(players: List[PlayerValue], ctx, n_weeks: int) -> float:
+    """Average points per week of the optimal lineup over the window"""
+    return sum(_solve_week(players, ctx, w)[0] for w in range(n_weeks)) / n_weeks
 
 
-def weeks_started(players: List[PlayerValue], slots, n_weeks: int) -> Dict[int, int]:
-    """How many of the upcoming weeks each player is in the optimal lineup"""
+def starter_ids(players: List[PlayerValue], ctx, n_weeks: int) -> set:
+    """Players in the optimal lineup for at least half of the window"""
     counts: Dict[int, int] = {}
     for w in range(n_weeks):
-        for p in _solve_week(players, slots, w)[1]:
+        for p in _solve_week(players, ctx, w)[1]:
             counts[id(p)] = counts.get(id(p), 0) + 1
-    return counts
-
-
-def analyze_team(team: TeamSnapshot, slots, n_weeks: int, season_weeks_remaining: int) -> Dict[int, Tuple[str, float]]:
-    """Role and effective weekly value of every player on a team, before any trade.
-
-    Starter (in the optimal lineup at least half of the window): full projected average.
-    Bench: only what he adds over a waiver pickup while covering the remaining bye weeks of the
-    starters at his position, amortized over the remaining season:
-        max(0, avg - waiver baseline) * bye weeks covered / weeks remaining
-    Only the best backup at each position gets that credit.
-    """
-    started = weeks_started(team.players, slots, n_weeks)
-    starters = [p for p in team.players if started.get(id(p), 0) * 2 >= n_weeks and started.get(id(p), 0) > 0]
-    starter_ids = {id(p) for p in starters}
-
-    result: Dict[int, Tuple[str, float]] = {id(p): ("Starter", p.base) for p in starters}
-
-    covered_byes: Dict[str, set] = {}
-    for p in starters:
-        covered_byes.setdefault(p.position, set()).update(p.bye_weeks)
-
-    bench: Dict[str, List[PlayerValue]] = {}
-    for p in team.players:
-        if id(p) not in starter_ids:
-            bench.setdefault(p.position, []).append(p)
-    for pos, players in bench.items():
-        players.sort(key=lambda p: p.base, reverse=True)
-        for rank, p in enumerate(players):
-            value = 0.0
-            if rank == 0:
-                weeks_covered = len(covered_byes.get(pos, set()) - set(p.bye_weeks))
-                upside = max(0.0, p.base - WAIVER_BASELINES.get(pos, 0.0))
-                value = upside * weeks_covered / max(1, season_weeks_remaining)
-            result[id(p)] = ("Bench", value)
-    return result
-
-
-def team_analysis(snapshot: "LeagueSnapshot", team: TeamSnapshot) -> Dict[int, Tuple[str, float]]:
-    if team.team_id not in snapshot.analysis:
-        snapshot.analysis[team.team_id] = analyze_team(
-            team, snapshot.slots, len(snapshot.weeks), snapshot.season_weeks_remaining
-        )
-    return snapshot.analysis[team.team_id]
-
-
-def get_effective_value(player: PlayerValue, team: TeamSnapshot, snapshot: "LeagueSnapshot") -> float:
-    """Weekly value of a player to the team that owns him (starter vs. bench rules above)"""
-    return team_analysis(snapshot, team).get(id(player), ("Bench", 0.0))[1]
+    return {pid for pid, c in counts.items() if c * 2 >= n_weeks}
 
 
 def position_strengths(teams: Dict[int, TeamSnapshot], slots) -> Dict[int, Dict[str, float]]:
@@ -367,205 +289,294 @@ def needs_table(teams: Dict[int, TeamSnapshot], slots, team_id: int) -> List[Dic
     return rows
 
 
-# --------------------------------------------------------------------- trades
+# ------------------------------------------------------------------------ MAI
 
-def _notes(give, get, partner_name, my_drop=(), their_drop=()) -> List[str]:
+def value_over_replacement(player: PlayerValue, drv: Dict[str, float]) -> float:
+    """V_p = max(0, projected PPG - top waiver PPG at the position)"""
+    return max(0.0, player.base - drv.get(player.position, 0.0))
+
+
+def s_tier_ids(snapshot: LeagueSnapshot) -> set:
+    """Ids of the league's Tier-1 Alpha assets: the top few rostered players at each position"""
+    ids = set()
+    for pos, top in S_TIER_TOP.items():
+        ranked = sorted(
+            (p for t in snapshot.teams.values() for p in t.players if p.position == pos),
+            key=lambda p: p.base,
+            reverse=True,
+        )
+        ids.update(id(p) for p in ranked[:top])
+    return ids
+
+
+def tier_for(mai: float) -> Optional[str]:
+    if mai >= WIN_WIN_MIN:
+        return "Win-Win"
+    if mai >= WORTH_A_SHOT_MIN:
+        return "Worth a Shot"
+    if mai >= LONG_SHOT_MIN:
+        return "Long Shot"
+    return None
+
+
+class TradeContext:
+    """Everything about one (you, target) pair that doesn't change between candidate trades"""
+
+    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int):
+        self.snapshot = snapshot
+        self.me = snapshot.teams[my_id]
+        self.target = snapshot.teams[target_id]
+        self.n = len(snapshot.weeks)
+        self.drv = snapshot.drv
+        self.ctx = slot_context(snapshot.slots, snapshot.drv)
+        self.s_tier = s_tier_ids(snapshot)
+
+        self.my_before = lineup_ppg(self.me.players, self.ctx, self.n)
+        self.target_before = lineup_ppg(self.target.players, self.ctx, self.n)
+        self.my_starters = starter_ids(self.me.players, self.ctx, self.n)
+        self.target_starters = starter_ids(self.target.players, self.ctx, self.n)
+        self.my_cut = self._cut_order(self.me.players, self.my_starters)
+        self.target_cut = self._cut_order(self.target.players, self.target_starters)
+
+        strengths = needs_table(snapshot.teams, snapshot.slots, target_id)
+        self.weak_positions = {r["Position"] for r in strengths if r["Status"] == "Weakness"}
+
+    def _cut_order(self, players, starters):
+        """Cheapest to cut first: bench before starters, then lowest value over replacement"""
+        return sorted(
+            players,
+            key=lambda p: (id(p) in starters, value_over_replacement(p, self.drv), p.base),
+        )
+
+    def evaluate(self, send: List[PlayerValue], receive: List[PlayerValue]) -> TradeProposal:
+        """Score `send` (from you) for `receive` (from the target) from the target's perspective"""
+        send_ids = {id(p) for p in send}
+        recv_ids = {id(p) for p in receive}
+
+        # whoever ends up with extra players must cut their cheapest bench players
+        target_drops = [p for p in self.target_cut if id(p) not in recv_ids][: max(0, len(send) - len(receive))]
+        my_drops = [p for p in self.my_cut if id(p) not in send_ids][: max(0, len(receive) - len(send))]
+        target_drop_ids = {id(p) for p in target_drops}
+        my_drop_ids = {id(p) for p in my_drops}
+
+        target_after = [
+            p for p in self.target.players if id(p) not in recv_ids and id(p) not in target_drop_ids
+        ] + list(send)
+        my_after = [
+            p for p in self.me.players if id(p) not in send_ids and id(p) not in my_drop_ids
+        ] + list(receive)
+
+        delta_lineup = lineup_ppg(target_after, self.ctx, self.n) - self.target_before
+        my_gain = lineup_ppg(my_after, self.ctx, self.n) - self.my_before
+
+        alpha = [p for p in receive if id(p) in self.s_tier]
+        tap = TAP_RATE * max(p.base for p in alpha) if alpha else 0.0
+        bcp = BCP_RATE * sum(value_over_replacement(p, self.drv) for p in target_drops)
+        if len(send) > len(receive):
+            tsp = TSP_RECEIVES_MORE
+        elif len(send) == len(receive) == 2:
+            tsp = TSP_TWO_FOR_TWO
+        else:
+            tsp = 0.0
+
+        post_starters = starter_ids(target_after, self.ctx, self.n)
+        incoming_starters = [p for p in send if id(p) in post_starters]
+        surrendered_starters = [p for p in receive if id(p) in self.target_starters]
+        ap = 0.0
+        if len(surrendered_starters) == 2 and len(send) == 2 and len(incoming_starters) == 1:
+            ap = AP_PENALTY
+
+        upgrades = self._upgrades(incoming_starters, recv_ids, post_starters)
+        weak = any(
+            displaced is None or displaced.base - self.drv.get(displaced.position, 0.0) <= WEAK_SLOT_MARGIN
+            for _, displaced, _ in upgrades
+        ) or any(p.position in self.weak_positions for p in incoming_starters)
+
+        mai = delta_lineup - tap - bcp - tsp - ap
+        return TradeProposal(
+            target_id=self.target.team_id,
+            target_name=self.target.name,
+            send=list(send),
+            receive=list(receive),
+            mai=mai,
+            delta_lineup=delta_lineup,
+            tap=tap, bcp=bcp, tsp=tsp, ap=ap,
+            my_gain=my_gain,
+            tier=self._assign_tier(mai, send, receive, alpha, weak),
+            target_drops=target_drops,
+            my_drops=my_drops,
+            upgrades=upgrades,
+            alpha_assets=alpha,
+            solves_deficiency=weak,
+            notes=_notes(send, receive),
+        )
+
+    def _upgrades(self, incoming_starters, recv_ids, post_starters):
+        """Which of the target's starters each incoming starter displaces (None = waiver-filled slot)"""
+        displaced_pool = [
+            p for p in self.target.players
+            if id(p) in self.target_starters and id(p) not in recv_ids and id(p) not in post_starters
+        ]
+        displaced_pool.sort(key=lambda p: p.base)
+        upgrades = []
+        for p in sorted(incoming_starters, key=lambda p: p.base, reverse=True):
+            match = next((d for d in displaced_pool if d.position == p.position), None) or (
+                displaced_pool[0] if displaced_pool else None
+            )
+            if match is not None:
+                displaced_pool.remove(match)
+                gain = max(0.0, p.base - match.base)
+            else:
+                gain = max(0.0, p.base - self.drv.get(p.position, 0.0))
+            upgrades.append((p, match, gain))
+        return upgrades
+
+    def _assign_tier(self, mai, send, receive, alpha, solves_deficiency) -> Optional[str]:
+        tier = tier_for(mai)
+        if tier == "Win-Win":
+            simple = (len(send), len(receive)) in ((1, 1), (2, 2))
+            unearned_alpha = bool(alpha) and not any(id(p) in self.s_tier for p in send)
+            if not (simple and solves_deficiency and not unearned_alpha):
+                tier = "Worth a Shot"
+        return tier
+
+
+def _notes(send, receive) -> List[str]:
     notes = []
-    for p in give + get:
+    for p in list(send) + list(receive):
         if p.injured:
             notes.append(f"{p.name} is {p.injury.replace('_', ' ').title()}")
-        if p.weekly and p.weekly.count(0.0) and not p.injured:
+        elif p.weekly and p.weekly.count(0.0):
             notes.append(f"{p.name} has a bye in the window")
-    if my_drop:
-        notes.append("You would drop " + ", ".join(p.name for p in my_drop))
-    if their_drop:
-        notes.append(f"{partner_name} would drop " + ", ".join(p.name for p in their_drop))
     return notes
 
 
-def side_value(players, tv: Dict[int, float]) -> float:
-    """Total trade value of a group of players, with a premium on the best one"""
-    values = [tv[id(p)] for p in players]
-    return sum(values) + (STAR_PREMIUM - 1) * max(values, default=0.0)
+# ------------------------------------------------------------------ generation
 
-
-def trade_values(snapshot: "LeagueSnapshot") -> Dict[int, float]:
-    """How an owner would value each player in a trade: points over replacement, stars weighted up.
-
-    Ignores byes and matchups (owners don't discount a player for a bye), and only discounts
-    serious injuries. This is separate from the lineup value used to measure the gain.
-    """
-    levels = WAIVER_BASELINES
-    values = {}
-    for team in snapshot.teams.values():
-        for p in team.players:
-            over = max(0.0, p.base - levels.get(p.position, 0.0))
-            values[id(p)] = (over ** VALUE_EXPONENT) * TRADE_INJURY_DISCOUNT.get(p.injury, 1.0)
-    return values
-
-
-def classify(my_gain: float, their_gain: float, give_value: float, get_value: float) -> str:
-    """How likely the other team is to say yes"""
-    top = max(give_value, get_value)
-    ratio = min(give_value, get_value) / top if top else 0
-    if (
-        their_gain >= MIN_THEIR_GAIN
-        and their_gain >= MIN_GAIN_BALANCE * my_gain
-        and ratio >= MIN_VALUE_RATIO
-    ):
-        return "Win-win"
-    if (their_gain >= 0 and ratio >= SHOT_VALUE_RATIO) or (give_value >= get_value and their_gain >= 0):
-        return "Worth a shot"
-    return "Long shot"
-
-
-def find_trades(
+def generate_trades(
     snapshot: LeagueSnapshot,
-    my_team_id: int,
-    min_gain: float = MIN_MY_GAIN,
-    max_results: Optional[int] = None,
-    per_partner: int = 3,
-    creative: bool = False,
-    focus_positions: Optional[List[str]] = None,
-) -> List[TradeProposal]:
-    """Rank trades that help me, help them, and are roughly even in value.
+    my_id: int,
+    target_id: int,
+    min_my_gain: float = MIN_MY_GAIN,
+    per_tier: int = PER_TIER,
+) -> Dict[str, List[TradeProposal]]:
+    """1 to `per_tier` proposals in each acceptance tier for one target team.
 
-    creative=True also returns longer shots (the other team gains little or loses a bit of
-    lineup value, or you overpay in raw value) and bigger packages (2-for-2, 3-for-1, 1-for-3).
-    focus_positions keeps only trades that bring back a player at one of those positions.
+    A proposal must give the target a non-negative lineup change and give you at least
+    `min_my_gain`; within a tier the ones that help you most come first.
     """
-    min_their = CREATIVE_MIN_THEIR_GAIN if creative else MIN_THEIR_GAIN
-    min_ratio = CREATIVE_MIN_VALUE_RATIO if creative else MIN_VALUE_RATIO
-    combos = [(1, 1), (2, 1), (1, 2)] + (CREATIVE_COMBOS if creative else [])
-    focus = set(focus_positions or [])
-    tv = trade_values(snapshot)
-    n = len(snapshot.weeks)
-    slots = snapshot.slots
-    me = snapshot.teams.get(my_team_id)
-    if not me or n == 0:
-        return []
+    result: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
+    if my_id not in snapshot.teams or target_id not in snapshot.teams or my_id == target_id:
+        return result
 
-    def useful(players):
-        return sorted((p for p in players if p.avg > 0), key=lambda p: p.avg, reverse=True)[:POOL_SIZE]
+    tc = TradeContext(snapshot, my_id, target_id)
+    if tc.n == 0:
+        return result
 
-    def by_value(players):
-        return sorted(players, key=lambda p: (tv[id(p)], p.avg))
+    def pool(players):
+        return sorted((p for p in players if p.base > 0), key=lambda p: p.base, reverse=True)[:POOL_SIZE]
 
-    my_pool = useful(me.players)
-    my_cheapest = by_value(me.players)
-    my_before = lineup_total(me.players, slots, n)
-    my_roles = team_analysis(snapshot, me)
-    proposals: List[TradeProposal] = []
+    my_pool, their_pool = pool(tc.me.players), pool(tc.target.players)
+    candidates: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
+    for send_n, recv_n in [(1, 1), (2, 1), (1, 2), (2, 2)]:
+        for send in combinations(my_pool, send_n):
+            for receive in combinations(their_pool, recv_n):
+                t = tc.evaluate(list(send), list(receive))
+                if t.tier is None or t.delta_lineup < 0 or t.my_gain < min_my_gain:
+                    continue
+                candidates[t.tier].append(t)
 
-    def search_partner(tid, other, min_gain, min_their, min_ratio) -> List[TradeProposal]:
-        their_pool = useful(other.players)
-        their_before = lineup_total(other.players, slots, n)
-        their_cheapest = by_value(other.players)
-        their_roles = team_analysis(snapshot, other)
-        found: List[TradeProposal] = []
-
-        # 1-for-1 gains, kept for every pair so multi-player swaps can be compared to them
-        single_gain: Dict[Tuple[int, int], float] = {}
-
-        for give_n, get_n in combos:
-            for give in combinations(my_pool, give_n):
-                for get in combinations(their_pool, get_n):
-                    give_ids = {id(p) for p in give}
-                    get_ids = {id(p) for p in get}
-
-                    # whoever ends up with extra players must cut the cheapest ones
-                    my_drop = [p for p in my_cheapest if id(p) not in give_ids][: max(0, get_n - give_n)]
-                    their_drop = [p for p in their_cheapest if id(p) not in get_ids][: max(0, give_n - get_n)]
-                    give_value = max(0.0, side_value(give, tv) - sum(tv[id(p)] for p in their_drop))
-                    get_value = max(0.0, side_value(get, tv) - sum(tv[id(p)] for p in my_drop))
-                    if not max(give_value, get_value) or (
-                        min(give_value, get_value) / max(give_value, get_value) < min_ratio
-                    ):
-                        continue
-
-                    my_drop_ids = {id(p) for p in my_drop}
-                    my_after = [
-                        p for p in me.players if id(p) not in give_ids and id(p) not in my_drop_ids
-                    ] + list(get)
-                    my_after_total = lineup_total(my_after, slots, n)
-                    my_gain = (my_after_total - my_before) / n
-
-                    if (give_n, get_n) == (1, 1):
-                        single_gain[(id(give[0]), id(get[0]))] = my_gain
-                    else:
-                        # skip swaps where the extra player adds nothing over a simpler 1-for-1
-                        simpler = max(
-                            single_gain.get((id(g), id(r)), float("-inf"))
-                            for g in give for r in get
-                        )
-                        if simpler >= my_gain - 0.25:
-                            continue
-                    if my_gain < min_gain:
-                        continue
-                    if focus and not any(p.position in focus for p in get):
-                        continue
-
-                    their_drop_ids = {id(p) for p in their_drop}
-                    their_after = [
-                        p for p in other.players if id(p) not in get_ids and id(p) not in their_drop_ids
-                    ] + list(give)
-                    their_after_total = lineup_total(their_after, slots, n)
-                    their_gain = (their_after_total - their_before) / n
-                    if their_gain < min_their:
-                        continue
-
-                    found.append(TradeProposal(
-                        partner_id=tid,
-                        partner_name=other.name,
-                        give=list(give),
-                        get=list(get),
-                        my_gain=my_gain,
-                        their_gain=their_gain,
-                        notes=_notes(list(give), list(get), other.name, my_drop, their_drop),
-                        tier=classify(my_gain, their_gain, give_value, get_value),
-                        give_value=give_value,
-                        get_value=get_value,
-                        my_before=my_before / n,
-                        my_after=my_after_total / n,
-                        their_before=their_before / n,
-                        their_after=their_after_total / n,
-                        give_info=[my_roles.get(id(p), ("Bench", 0.0)) for p in give],
-                        get_info=[their_roles.get(id(p), ("Bench", 0.0)) for p in get],
-                    ))
-
-        found.sort(key=lambda t: t.rank_key)
-        # keep the best few per partner, without repeating the same player on either side
-        used_give, used_get = set(), set()
-        kept_trades: List[TradeProposal] = []
-        kept = 0
+    for tier, found in candidates.items():
+        found.sort(key=lambda t: (-t.my_gain, -t.mai))
+        used_send, used_recv = set(), set()
         for t in found:
-            gids, rids = {id(p) for p in t.give}, {id(p) for p in t.get}
-            if gids & used_give or rids & used_get:
+            s_ids, r_ids = {id(p) for p in t.send}, {id(p) for p in t.receive}
+            if s_ids & used_send or r_ids & used_recv:
                 continue
-            kept_trades.append(t)
-            used_give |= gids
-            used_get |= rids
-            kept += 1
-            if kept >= per_partner:
+            t.why = explain(t)
+            result[tier].append(t)
+            used_send |= s_ids
+            used_recv |= r_ids
+            if len(result[tier]) >= per_tier:
                 break
-        return kept_trades
+    return result
 
-    # Every team gets a look. In creative mode a team with no fit under the normal bar is
-    # retried with a much lower bar, so you always see the best available angle with each team.
-    attempts = [(min_gain, min_their, min_ratio)]
-    if creative:
-        attempts.append((min(min_gain, 0.25), FALLBACK_MIN_THEIR_GAIN, FALLBACK_MIN_VALUE_RATIO))
-    for tid, other in snapshot.teams.items():
-        if tid == my_team_id:
-            continue
-        for gain_bar, their_bar, ratio_bar in attempts:
-            kept_trades = search_partner(tid, other, gain_bar, their_bar, ratio_bar)
-            if kept_trades:
-                proposals.extend(kept_trades)
-                break
 
-    proposals.sort(key=lambda t: t.rank_key)
-    return proposals[:max_results] if max_results else proposals
+def evaluate_custom(snapshot: LeagueSnapshot, my_id: int, target_id: int, send, receive) -> TradeProposal:
+    """Score a specific trade you typed in (same MAI as the generated ones)"""
+    tc = TradeContext(snapshot, my_id, target_id)
+    t = tc.evaluate(list(send), list(receive))
+    t.why = explain(t)
+    return t
+
+
+# ----------------------------------------------------------------- explanations
+
+def _names(players) -> str:
+    return " + ".join(p.name for p in players)
+
+
+def _structure(t: TradeProposal) -> str:
+    return f"{len(t.send)}-for-{len(t.receive)}"
+
+
+def _upgrade_text(t: TradeProposal) -> str:
+    parts = []
+    for p, displaced, gain in t.upgrades:
+        over = (
+            f"over {displaced.name} ({displaced.base:.1f})"
+            if displaced else "in a slot they'd otherwise fill from waivers"
+        )
+        parts.append(f"{p.name} ({p.base:.1f} PPG) would start at {p.position} {over}, +{gain:.1f} PPG")
+    return "; ".join(parts)
+
+
+def _frictions(t: TradeProposal) -> List[str]:
+    out = []
+    if t.tsp:
+        out.append(f"{_structure(t)} structure (-{t.tsp:.1f})")
+    if t.bcp:
+        out.append(f"they'd have to cut {_names(t.target_drops)} (-{t.bcp:.1f})")
+    if t.tap:
+        out.append(f"they'd be giving up S-tier {_names(t.alpha_assets)} (-{t.tap:.1f} Alpha tax)")
+    if t.ap:
+        out.append(f"two starters out for one starter plus a bench piece (-{t.ap:.1f})")
+    return out
+
+
+def explain(t: TradeProposal) -> str:
+    """One paragraph in the voice the tier calls for"""
+    upside = _upgrade_text(t)
+    friction = _frictions(t)
+    if t.tier == "Win-Win":
+        return (
+            f"Fills a weak starting slot for {t.target_name}: {upside or 'improves their lineup'}. "
+            f"Clean {_structure(t)} with no Alpha asset requested, so there's little friction."
+        )
+    if t.tier == "Worth a Shot":
+        hesitate = "; ".join(friction) if friction else (
+            "the gain is real but modest, near the point where owner bias decides it"
+        )
+        return f"Upside for them: {upside or f'+{t.delta_lineup:.1f} PPG in their lineup'}. Hesitation: {hesitate}."
+    reasons = "; ".join(friction) if friction else "the lineup gain for them is marginal"
+    pitch = []
+    for p in t.alpha_assets:
+        if p.injured:
+            pitch.append(f"{p.name} is {p.injury.replace('_', ' ').title()}, which is the opening to ask for him")
+        elif p.weekly and p.weekly.count(0.0):
+            pitch.append(f"{p.name} is on a bye inside the window, so his short-term value to them is lower")
+    if t.upgrades:
+        p, _, gain = t.upgrades[0]
+        pitch.append(
+            f"lead with the {p.position} upgrade: +{gain:.1f} PPG at the slot, "
+            f"+{t.delta_lineup:.1f} PPG for their lineup"
+        )
+    if t.target_drops:
+        pitch.append("offer to take the roster clutter off their hands")
+    return (
+        f"They'll likely resist: {reasons}. "
+        f"How to pitch it: {'; '.join(pitch) or 'frame it around the lineup upgrade for them'}."
+    )
 
 
 # ------------------------------------------------------------ ESPN integration
@@ -591,19 +602,49 @@ def _fetch_ratings(league, weeks: List[int]) -> Dict[int, Dict[str, Dict[str, in
     return out
 
 
+def fetch_drv(league, week: int) -> Tuple[Dict[str, float], bool]:
+    """Top waiver PPG at each position from the league's actual free agents.
+
+    Returns (drv, live). Positions whose lookup fails fall back to FALLBACK_DRV, and live is
+    False unless every position came from real free agents.
+    """
+    drv = dict(FALLBACK_DRV)
+    live = True
+    for pos in FALLBACK_DRV:
+        try:
+            best = 0.0
+            for fa in league.free_agents(week=week, size=25, position=pos):
+                status = (getattr(fa, "injuryStatus", "") or "ACTIVE").upper()
+                if status in ("OUT", "INJURY_RESERVE", "SUSPENSION"):
+                    continue
+                best = max(best, base_points(
+                    getattr(fa, "avg_points", 0),
+                    getattr(fa, "projected_avg_points", 0),
+                    getattr(fa, "total_points", 0),
+                ))
+            if best > 0:
+                drv[pos] = best
+            else:
+                live = False
+        except Exception as e:
+            logger.warning(f"Could not load free agents for {pos}: {e}")
+            live = False
+    return drv, live
+
+
 def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnapshot:
     """Read an espn_api League into plain data the engine can work on"""
     current = getattr(league, "current_week", None) or getattr(league, "nfl_week", 1)
-    last_week = 18
-    weeks = list(range(current, min(current + weeks_ahead, last_week + 1)))
+    weeks = list(range(current, min(current + weeks_ahead, SEASON_LAST_WEEK + 1)))
     ratings = _fetch_ratings(league, weeks)
+    drv, drv_live = fetch_drv(league, current)
 
     teams = {}
     for team in league.teams:
         teams[team.team_id] = TeamSnapshot(
             team_id=team.team_id,
             name=team.team_name,
-            players=[build_player_value(p, weeks, ratings, current) for p in team.roster],
+            players=[build_player_value(p, weeks, ratings) for p in team.roster],
             record=f"{team.wins}-{team.losses}",
         )
 
@@ -612,5 +653,6 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
         slots=build_slots(league.settings.position_slot_counts),
         weeks=weeks,
         schedule_adjusted=bool(ratings),
-        season_weeks_remaining=max(1, last_week - current + 1),
+        drv=drv,
+        drv_live=drv_live,
     )
