@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    PENALTY_LABELS, positions_fixed, why_no_tier,
+    FUNNEL_LABELS, PENALTY_LABELS, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -60,10 +60,10 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
 
 
 @st.cache_data(ttl=300, show_spinner="Scanning rosters, free agents and schedules...")
-def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict):
+def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict, min_gain):
     """Trade proposals for one target team (the snapshot underneath is cached too)"""
     snapshot = cached_snapshot(_lm, league_name, weeks_ahead)
-    return generate_trades(snapshot, my_id, target_id, strict=strict)
+    return generate_trades(snapshot, my_id, target_id, strict=strict, min_gain=min_gain)
 
 
 TIER_STYLE = {
@@ -141,6 +141,20 @@ def render_proposal(t, why_label=None):
             st.caption("They would cut: " + ", ".join(p.name for p in t.theirs.drops))
 
 
+def render_misses(trades):
+    """When few or no trades clear a tier: why, and the closest fair trades"""
+    total = sum(len(trades[t]) for t in TIERS)
+    if total == 0 and trades.funnel:
+        parts = [f"{trades.funnel[k]} {FUNNEL_LABELS[k]}" for k in FUNNEL_LABELS if k not in ("qualified",) and trades.funnel.get(k)]
+        st.caption("Nothing cleared a tier. " + "; ".join(parts) + ".")
+    if trades.near_misses:
+        with st.expander(f"Closest misses ({len(trades.near_misses)})", expanded=total == 0):
+            st.caption("Fair for both sides, but below the gain bar for a tier. Worth a look if you'd take a small edge.")
+            for t in trades.near_misses:
+                st.markdown(f"⚪ {why_no_tier(t)}")
+                render_proposal(t)
+
+
 def render_tiers(trades):
     for tier in TIERS:
         icon, title, why_label = TIER_STYLE[tier]
@@ -149,6 +163,7 @@ def render_tiers(trades):
             st.caption("No proposal in this tier.")
         for t in trades[tier]:
             render_proposal(t)
+    render_misses(trades)
 
 
 def record_class(wins, losses):
@@ -410,6 +425,10 @@ def main():
         with c1:
             weeks_ahead = st.slider("Weeks to look ahead", 1, 6, WEEKS_AHEAD)
         with c2:
+            min_gain = st.slider(
+                "Smallest gain for you (PPG)", 0.0, 2.0, 0.5, 0.1,
+                help="The smallest lineup gain for you that still counts as Worth a Shot. Lower it to see more trades.",
+            )
             strict = st.toggle(
                 "Strict acceptance (their MAI ≥ +1.5)",
                 value=False,
@@ -459,15 +478,16 @@ def main():
             target_choice = st.selectbox("Target team", ["Scan every team"] + list(others))
             if target_choice == "Scan every team":
                 for name, tid in others.items():
-                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict)
+                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict, min_gain)
                     total = sum(len(v) for v in trades.values())
-                    best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "·")
-                    label = f"{best} {md_escape(name)} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}"
+                    best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "⚪" if trades.near_misses else "·")
+                    extra = f" + {len(trades.near_misses)} close" if not total and trades.near_misses else ""
+                    label = f"{best} {md_escape(name)} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}{extra}"
                     with st.expander(label, expanded=False):
                         render_tiers(trades)
             else:
                 render_tiers(cached_trades(
-                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict
+                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict, min_gain
                 ))
 
             st.subheader("Score your own trade")
