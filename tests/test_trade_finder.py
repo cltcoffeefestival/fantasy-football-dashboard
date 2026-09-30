@@ -422,3 +422,19 @@ def test_empty_result_explains_itself_and_offers_the_closest_misses():
     for t in result.near_misses:
         assert t.tier is None and not t.blocked and t.theirs.delta >= 0 and t.mine.delta > 0
         assert t.you_why and why_no_tier(t)
+
+
+def test_lowering_the_minimum_gain_lets_a_small_but_fair_trade_through():
+    me = core("m", [P("mRB3", "RB", 13)])
+    for p in me:
+        if p.name == "mWR2":
+            p.weekly[:], p.base = [9.5] * WEEKS, 9.5
+    target = core("t", [P("tWR3", "WR", 10.5)])
+    for p in target:
+        if p.name == "tRB2":
+            p.weekly[:], p.base = [8.0] * WEEKS, 8.0
+    snap = snapshot(me, target, [core(f"f{i}", te=13) for i in range(3)])
+    strict_bar = generate_trades(snap, 1, 2)                       # default 1.0
+    lower = generate_trades(snap, 1, 2, min_gain=0.1)
+    assert sum(len(v) for v in lower.values()) >= sum(len(v) for v in strict_bar.values())
+    assert all(t.my_gain >= 0.1 for ps in lower.values() for t in ps)

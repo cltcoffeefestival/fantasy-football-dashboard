@@ -461,8 +461,9 @@ class Side:
 class TradeContext:
     """Everything about one (you, target) pair that doesn't change between candidate trades"""
 
-    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int):
+    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int, min_gain: float = WORTH_A_SHOT[3]):
         self.snapshot = snapshot
+        self.min_gain = min_gain     # your smallest gain for a Worth a Shot trade (PPG)
         self.n = len(snapshot.weeks)
         self.drv = snapshot.drv
         self.ctx = slot_context(snapshot.slots, snapshot.drv)
@@ -654,7 +655,7 @@ class TradeContext:
         if mai >= WIN_WIN[1] and mine >= WIN_WIN[3] and simple and mutual_holes and no_redundancy:
             return WIN_WIN[0]
         # a trade that clears the Win-Win numbers but breaks its structure rules is still worth a shot
-        if mai >= WORTH_A_SHOT[1] and mine >= WORTH_A_SHOT[3]:
+        if mai >= WORTH_A_SHOT[1] and mine >= self.min_gain:
             return WORTH_A_SHOT[0]
         if LONG_SHOT[1] <= mai < LONG_SHOT[2] and mine >= LONG_SHOT[3]:
             return LONG_SHOT[0]
@@ -770,6 +771,7 @@ def generate_trades(
     target_id: int,
     strict: bool = False,
     per_tier: int = PER_TIER,
+    min_gain: float = WORTH_A_SHOT[3],
 ) -> TradeResults:
     """Proposals in each acceptance tier for one target team, best mutual utility first.
 
@@ -781,7 +783,7 @@ def generate_trades(
     if my_id not in snapshot.teams or target_id not in snapshot.teams or my_id == target_id:
         return result
 
-    tc = TradeContext(snapshot, my_id, target_id)
+    tc = TradeContext(snapshot, my_id, target_id, min_gain=min_gain)
     if tc.n == 0:
         return result
 
