@@ -390,3 +390,15 @@ def test_backup_te_steps_in_when_the_starter_is_traded_and_the_lineup_table_show
     assert after == {"Loveland": 11.0}       # Loveland plays TE, not a waiver pickup
     # so losing Bowers costs 16.2 - 11.0 at TE, not 16.2 - the waiver TE
     assert abs((11.0 - 16.2) - (-5.2)) < 1e-9
+
+
+def test_blocked_message_names_the_side_and_the_players():
+    # Loveland (bench TE) for a starting WR: THEY would be swapping a starter for a redundant bench TE
+    me = core("m", [P("Loveland", "TE", 7.3)], te=16.2)
+    target = core("t", [P("Tate", "WR", 11.2)], te=15.0)
+    fillers = [core(f"f{i}", te=9) for i in range(3)]
+    tc = TradeContext(snapshot(me, target, fillers), 1, 2)
+    t = tc.evaluate([p for p in me if p.name == "Loveland"], [p for p in target if p.name == "Tate"])
+    assert t.blocked and t.theirs.blocked and not t.mine.blocked
+    msg = why_no_tier(t)
+    assert msg.startswith("Blocked: They'd give up starter Tate for bench piece Loveland at TE")
