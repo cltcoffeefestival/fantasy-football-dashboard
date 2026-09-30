@@ -627,6 +627,35 @@ class TradeContext:
         return None
 
 
+def why_no_tier(t: TradeProposal) -> str:
+    """Which bar a trade misses, in plain words (empty when it does clear a tier)"""
+    if t.tier is not None:
+        return ""
+    if t.blocked:
+        return "Blocked: it gives up a starter for a bench piece at a position where you're already elite."
+    if t.theirs.delta < 0:
+        return f"Their lineup gets worse ({t.theirs.delta:+.1f} PPG), so they have no reason to accept."
+    if t.mine.delta <= 0:
+        return f"It doesn't improve your lineup ({t.mine.delta:+.1f} PPG)."
+    mai, mine = t.mai, t.mine.delta
+    if mai < LONG_SHOT[1]:
+        return f"Their acceptance score is {mai:+.1f}, below the {LONG_SHOT[1]:+.1f} floor for even a Long Shot."
+    if mai >= WIN_WIN[1]:
+        return (
+            f"It's easy for them to accept (MAI {mai:+.1f}), but your gain of {mine:+.1f} PPG is below "
+            f"the {WORTH_A_SHOT[3]:.1f} needed for Worth a Shot ({WIN_WIN[3]:.1f} for Win-Win)."
+        )
+    if mai >= WORTH_A_SHOT[1]:
+        return (
+            f"Their MAI is fine ({mai:+.1f}), but your gain of {mine:+.1f} PPG is below the "
+            f"{WORTH_A_SHOT[3]:.1f} needed for Worth a Shot."
+        )
+    return (
+        f"Their MAI is only {mai:+.1f}, which makes it a Long Shot at best, and a Long Shot needs a "
+        f"gain of {LONG_SHOT[3]:.1f}+ PPG for you (you'd get {mine:+.1f})."
+    )
+
+
 def _notes(send, receive) -> List[str]:
     notes = []
     for p in list(send) + list(receive):

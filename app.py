@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    PENALTY_LABELS, positions_fixed,
+    PENALTY_LABELS, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -427,6 +427,8 @@ def main():
                     st.warning("Blocked: this gives up starting depth for a redundant bench piece where you're already elite.")
                 icon = TIER_STYLE[t.tier][0] if t.tier else "⛔"
                 st.markdown(f"{icon} **{t.tier or 'Does not clear any tier'}**")
+                if not t.tier:
+                    st.info(why_no_tier(t))
                 render_proposal(t)
 
     # Page: Team Analysis
