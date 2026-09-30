@@ -1,13 +1,13 @@
-"""Tests for the MAI trade engine: lineup math, each penalty, tiers and generation."""
+"""Tests for the M-HATE trade engine: lineup math, each penalty, redundancy rules, tiers, generation."""
 import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trade_finder import (  # noqa: E402
-    AP_PENALTY, FALLBACK_DRV, LONG_SHOT_MIN, TAP_RATE, TSP_RECEIVES_MORE, TSP_TWO_FOR_TWO,
+    FALLBACK_DRV, TAP_RATE, TSP_TARGET_RECEIVES_FEWER, TSP_TARGET_RECEIVES_MORE, TSP_TWO_FOR_TWO,
     LeagueSnapshot, PlayerValue, TeamSnapshot, TradeContext, build_slots, generate_trades,
-    lineup_ppg, slot_context, tier_for, value_over_replacement,
+    lineup_ppg, single_slot_positions, slot_context, structure_penalty, value_over_replacement,
 )
 
 SLOTS = build_slots({"QB": 1, "RB": 2, "WR": 2, "TE": 1, "RB/WR/TE": 1, "D/ST": 1, "K": 1, "BE": 6})
@@ -19,10 +19,10 @@ def P(name, pos, pts):
     return PlayerValue(name, pos, "X", "ACTIVE", pts, [pts] * WEEKS)
 
 
-def core(prefix="", extra=()):
-    return [P(prefix + "QB", "QB", 20), P(prefix + "RB1", "RB", 15), P(prefix + "RB2", "RB", 12),
-            P(prefix + "WR1", "WR", 14), P(prefix + "WR2", "WR", 12), P(prefix + "DST", "D/ST", 7),
-            P(prefix + "K", "K", 7)] + list(extra)
+def core(prefix="", extra=(), qb=20, te=8):
+    return [P(prefix + "QB", "QB", qb), P(prefix + "TE", "TE", te), P(prefix + "RB1", "RB", 15),
+            P(prefix + "RB2", "RB", 12), P(prefix + "WR1", "WR", 14), P(prefix + "WR2", "WR", 12),
+            P(prefix + "DST", "D/ST", 7), P(prefix + "K", "K", 7)] + list(extra)
 
 
 def snapshot(me, target, filler=()):
@@ -30,6 +30,13 @@ def snapshot(me, target, filler=()):
     for i, roster in enumerate(filler, start=3):
         teams[i] = TeamSnapshot(i, f"Team {i}", roster)
     return LeagueSnapshot(teams, SLOTS, list(range(5, 5 + WEEKS)), True)
+
+
+def evaluate(snap, send_names, recv_names):
+    tc = TradeContext(snap, 1, 2)
+    send = [p for p in snap.teams[1].players if p.name in send_names]
+    recv = [p for p in snap.teams[2].players if p.name in recv_names]
+    return tc.evaluate(send, recv)
 
 
 def weekly(players):
@@ -40,120 +47,122 @@ def without(players, *names):
     return [p for p in players if p.name not in names]
 
 
-# ---- lineup math (dLineup)
+# ---- lineup math
 
 def test_vacant_starter_slot_falls_back_to_waiver_value():
-    roster = core(extra=[P("Bowers", "TE", 12), P("FlexRB", "RB", 9)])
-    lost = weekly(roster) - weekly(without(roster, "Bowers"))
+    roster = core(extra=[P("FlexRB", "RB", 9)], te=12)
+    lost = weekly(roster) - weekly(without(roster, "TE"))
     assert abs(lost - (12 - FALLBACK_DRV["TE"])) < 1e-9
 
 
 def test_vacant_starter_slot_uses_best_bench_player_when_better_than_waiver():
-    roster = core(extra=[P("Bowers", "TE", 12), P("BenchTE", "TE", 8.5), P("FlexRB", "RB", 9)])
-    lost = weekly(roster) - weekly(without(roster, "Bowers"))
-    assert abs(lost - (12 - 8.5)) < 1e-9
+    roster = core(extra=[P("BenchTE", "TE", 8.5), P("FlexRB", "RB", 9)], te=12)
+    assert abs((weekly(roster) - weekly(without(roster, "TE"))) - (12 - 8.5)) < 1e-9
 
 
-def test_opponent_losing_a_starter_and_a_bench_player_is_replaced_from_what_remains():
-    roster = core(extra=[P("TE", "TE", 8), P("Watson", "WR", 16.8), P("Montgomery", "RB", 12.7), P("BenchWR", "WR", 10.5)])
-    after = without(roster, "Watson", "Montgomery")
-    # RB 12.7 -> 12 (-0.7), WR slots 16.8/14 -> 14/12 (-4.8), flex 12 -> 10.5 (-1.5)
-    assert abs((weekly(roster) - weekly(after)) - 7.0) < 1e-9
+def test_opponent_losing_a_starter_and_bench_player_is_replaced_from_what_remains():
+    roster = core(extra=[P("Watson", "WR", 16.8), P("Montgomery", "RB", 12.7), P("BenchWR", "WR", 10.5)])
+    assert abs((weekly(roster) - weekly(without(roster, "Watson", "Montgomery"))) - 7.0) < 1e-9
 
 
-def test_replacement_level_comes_from_the_snapshot_drv():
-    roster = core(extra=[P("Bowers", "TE", 12)])
-    high = slot_context(SLOTS, {**FALLBACK_DRV, "TE": 9.0})
-    assert lineup_ppg(without(roster, "Bowers"), high, WEEKS) > lineup_ppg(without(roster, "Bowers"), CTX, WEEKS)
+def test_one_qb_one_te_format_detection():
+    assert single_slot_positions(SLOTS) == {"QB", "TE"}
+    superflex = build_slots({"QB": 1, "RB": 2, "WR": 2, "TE": 1, "OP": 1})
+    assert single_slot_positions(superflex) == {"TE"}
 
 
-# ---- penalties
+# ---- target penalties
 
-def pair(me_extra, target_extra, filler=()):
-    return snapshot(core("m", me_extra), core("t", target_extra), filler)
-
-
-def evaluate(snap, send_names, recv_names):
-    tc = TradeContext(snap, 1, 2)
-    send = [p for p in snap.teams[1].players if p.name in send_names]
-    recv = [p for p in snap.teams[2].players if p.name in recv_names]
-    return tc.evaluate(send, recv)
+def test_structure_penalty_table():
+    assert structure_penalty(1, 1) == 0.0
+    assert structure_penalty(2, 2) == TSP_TWO_FOR_TWO
+    assert structure_penalty(2, 1) == TSP_TARGET_RECEIVES_MORE      # target receives 2, gives 1
+    assert structure_penalty(1, 2) == TSP_TARGET_RECEIVES_FEWER     # target receives 1, gives 2
 
 
-def test_tsp_by_structure():
+def pair(me_extra, target_extra, filler=(), **kw):
+    return snapshot(core("m", me_extra, **kw), core("t", target_extra), filler)
+
+
+def test_tsp_applied_to_trades():
     snap = pair([P("a", "WR", 13), P("b", "WR", 12.5)], [P("x", "WR", 13), P("y", "WR", 12.5)])
     assert evaluate(snap, ["a"], ["x"]).tsp == 0.0
     assert evaluate(snap, ["a", "b"], ["x", "y"]).tsp == TSP_TWO_FOR_TWO
-    assert evaluate(snap, ["a", "b"], ["x"]).tsp == TSP_RECEIVES_MORE
-    assert evaluate(snap, ["a"], ["x", "y"]).tsp == 0.0
+    assert evaluate(snap, ["a", "b"], ["x"]).tsp == TSP_TARGET_RECEIVES_MORE
+    assert evaluate(snap, ["a"], ["x", "y"]).tsp == TSP_TARGET_RECEIVES_FEWER
 
 
-def test_bcp_is_half_the_value_over_replacement_of_the_bench_player_they_cut():
+def test_bcp_only_when_target_receives_two_plus_and_cuts_a_bench_player():
     bench = P("tbench", "WR", 11.5)
     snap = pair([P("a", "WR", 13), P("b", "WR", 12.5)], [P("x", "WR", 13), bench])
     t = evaluate(snap, ["a", "b"], ["x"])
-    assert t.target_drops == [bench]
+    assert t.theirs.drops == [bench]
     assert abs(t.bcp - 0.5 * value_over_replacement(bench, FALLBACK_DRV)) < 1e-9
     assert evaluate(snap, ["a"], ["x"]).bcp == 0.0
 
 
-def test_tap_applies_when_the_target_surrenders_an_s_tier_asset():
-    star = P("Star", "WR", 22)
+def test_tap_applies_when_target_surrenders_an_s_tier_asset():
     fillers = [core(f"f{i}", [P(f"fw{i}", "WR", 10 + i * 0.1)]) for i in range(3)]
-    snap = pair([P("a", "WR", 20)], [star], fillers)
-    t = evaluate(snap, ["a"], ["Star"])
-    assert abs(t.tap - TAP_RATE * 22) < 1e-9
+    snap = pair([P("a", "WR", 20)], [P("Star", "WR", 22)], fillers)
+    assert abs(evaluate(snap, ["a"], ["Star"]).tap - TAP_RATE * 22) < 1e-9
     assert evaluate(snap, ["a"], ["tRB2"]).tap == 0.0
 
 
-def test_ap_when_target_surrenders_two_starters_for_one_starter_plus_bench():
-    me = [P("Good", "WR", 18), P("Scrub", "WR", 8.0)]
-    target = [P("T1", "WR", 15), P("T2", "WR", 14.5)]
-    snap = pair(me, target)
-    t = evaluate(snap, ["Good", "Scrub"], ["T1", "T2"])
-    assert t.ap == AP_PENALTY
-    # send two starters instead: no asymmetry
-    snap2 = pair([P("Good", "WR", 18), P("Good2", "WR", 17)], target)
-    assert evaluate(snap2, ["Good", "Good2"], ["T1", "T2"]).ap == 0.0
+def test_plt_when_target_surrenders_qb1_without_a_starting_replacement():
+    snap = pair([P("BenchQB", "QB", 14)], [], qb=17)
+    # target's QB1 (tQB, 20) goes away; my bench QB (14) comes back but can't be tQB's replacement in a
+    # way that starts? it does start (nobody else), so no PLT
+    t = evaluate(snap, ["BenchQB"], ["tQB"])
+    assert t.plt == 0.0
+    # target gets a non-QB back: PLT = QB1 PPG - waiver DRV
+    snap2 = pair([P("aWR", "WR", 13)], [], qb=17)
+    t2 = evaluate(snap2, ["aWR"], ["tQB"])
+    assert abs(t2.plt - (20 - FALLBACK_DRV["QB"])) < 1e-9
 
 
 def test_mai_is_delta_lineup_minus_the_penalties():
     snap = pair([P("a", "WR", 13), P("b", "WR", 12.5)], [P("x", "WR", 13)])
     t = evaluate(snap, ["a", "b"], ["x"])
-    assert abs(t.mai - (t.delta_lineup - t.tap - t.bcp - t.tsp - t.ap)) < 1e-9
+    assert abs(t.mai - (t.delta_lineup - t.tap - t.bcp - t.tsp - t.plt)) < 1e-9
+    assert abs(t.nmu - (t.my_gain + t.mai)) < 1e-9
+
+
+# ---- redundancy (your side and theirs)
+
+def test_second_qb_behind_a_top_tier_qb1_contributes_nothing():
+    # my QB1 (mQB, 20) is the best QB in the league -> S-tier; an incoming better QB adds 0
+    snap = pair([P("aWR", "WR", 13)], [P("StarQB2", "QB", 25)], qb=20)
+    t = evaluate(snap, ["aWR"], ["StarQB2"])
+    assert t.mine.delta <= 0 or all(p.name != "StarQB2" for p, _, _ in t.mine.upgrades)
+
+
+def test_no_starting_depth_for_a_redundant_bench_piece():
+    snap = pair([P("aWR", "WR", 14.5)], [P("BackupQB", "QB", 15)], qb=25)
+    t = evaluate(snap, ["aWR"], ["BackupQB"])
+    assert t.mine.redundant and t.mine.blocked and t.tier is None
 
 
 # ---- tiers and generation
 
-def test_tier_bands():
-    assert tier_for(2.0) == "Win-Win" and tier_for(2.4) == "Win-Win"
-    assert tier_for(1.99) == "Worth a Shot" and tier_for(0.5) == "Worth a Shot"
-    assert tier_for(0.49) == "Long Shot" and tier_for(LONG_SHOT_MIN) == "Long Shot"
-    assert tier_for(-1.51) is None
-
-
-def test_generate_trades_respects_tiers_and_limits():
+def test_generated_trades_meet_each_tier_bar_on_both_sides():
     me = core("m", [P("mWR3", "WR", 13), P("mRB3", "RB", 14), P("mRB4", "RB", 12.5)])
-    target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tTE", "TE", 6.0)])
-    snap = snapshot(me, target)
-    result = generate_trades(snap, 1, 2, min_my_gain=0.0)
-    assert set(result) == {"Win-Win", "Worth a Shot", "Long Shot"}
+    target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tTE2", "TE", 6.0)])
+    result = generate_trades(snapshot(me, target), 1, 2)
     for tier, proposals in result.items():
-        assert len(proposals) <= 2
         for t in proposals:
-            assert t.delta_lineup >= 0 and t.mai >= LONG_SHOT_MIN
-            assert t.tier == tier and t.why
+            assert t.tier == tier and not t.blocked
+            assert t.theirs.delta >= 0 and t.my_gain > 0
+            assert t.you_why and t.them_why
+            if tier == "Win-Win":
+                assert t.mai >= 2.0 and t.my_gain >= 1.5 and (len(t.send), len(t.receive)) in ((1, 1), (2, 2))
             if tier == "Worth a Shot":
-                assert t.mai >= 0.5 or t.mai >= 2.0  # demoted Win-Wins keep their high MAI
+                assert t.mai >= 0.5 and t.my_gain >= 1.0
             if tier == "Long Shot":
-                assert t.mai < 0.5
-    used = [p for ps in result.values() for t in ps for p in t.send]
-    assert used or all(not v for v in result.values())
+                assert -1.5 <= t.mai < 0.5 and t.my_gain >= 3.0
 
 
-def test_win_win_never_asks_for_an_alpha_asset_without_sending_one():
-    fillers = [core(f"f{i}", [P(f"fw{i}", "WR", 10 + i * 0.1)]) for i in range(3)]
-    snap = pair([P("a", "WR", 21), P("b", "WR", 20)], [P("Star", "WR", 22)], fillers)
-    tc = TradeContext(snap, 1, 2)
-    t = tc.evaluate([snap.teams[1].players[-1]], [snap.teams[2].players[-1]])
-    assert t.tier != "Win-Win"
+def test_strict_mode_only_returns_trades_the_target_clearly_clears():
+    me = core("m", [P("mWR3", "WR", 13), P("mRB3", "RB", 14), P("mRB4", "RB", 12.5)])
+    target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tTE2", "TE", 6.0)])
+    result = generate_trades(snapshot(me, target), 1, 2, strict=True)
+    assert all(t.mai >= 1.5 for ps in result.values() for t in ps)

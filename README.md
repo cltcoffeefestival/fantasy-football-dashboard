@@ -7,7 +7,7 @@ A comprehensive web dashboard to analyze your ESPN Fantasy Football teams across
 - **Dashboard**: team cards for every league, sorted by standing, with your own teams highlighted
 - **My Teams**: record, standing, points per week and the roster grouped by position
 - **Waiver Wire**: best available free agent at each position, plus a filterable free agent table
-- **Trade Finder**: scores trades from the other manager's side with the Manager Acceptance Index (MAI = ΔLineup − Alpha tax − bench clutter − trade structure − asymmetry) and proposes Win-Win, Worth a Shot and Long Shot trades for any team, plus a scorer for trades you type in
+- **Trade Finder**: finds trades that work for both managers. Your side is scored by net starting-lineup gain; theirs by the Manager Acceptance Index (lineup change minus Alpha tax, bench clutter, trade structure and lost QB1/TE1 penalties). Proposes Win-Win, Worth a Shot and Long Shot trades for any team (or every team), and scores trades you type in
 - **Team Analysis**: team summary
 - **Standings**: points-for chart and full standings for each league
 
