@@ -13,6 +13,7 @@ from trade_finder import (
 )
 from config import LEAGUES
 import logging
+import re
 from pathlib import Path
 import html
 
@@ -72,6 +73,27 @@ TIER_STYLE = {
 }
 
 
+def md_escape(text):
+    """Team names can contain markdown characters (**Yamakas **); show them literally"""
+    return re.sub(r"([*_`~\[\]])", r"\\\1", str(text))
+
+
+def player_values_table(team, drv):
+    """What the model sees for each player: PPG, window average, injury, weeks at zero"""
+    rows = []
+    for p in sorted(team.players, key=lambda p: (p.position, -p.base)):
+        rows.append({
+            "Player": p.name,
+            "Pos": p.position,
+            "PPG": round(p.base, 1),
+            "Window avg": round(p.avg, 1),
+            "Above waiver": round(p.base - drv.get(p.position, 0.0), 1),
+            "Injury": "" if not p.injured else p.injury.replace("_", " ").title(),
+            "Zero weeks": sum(1 for w in p.weekly if w == 0),
+        })
+    return rows
+
+
 def names(players):
     return " + ".join(f"**{p.name}** ({p.position}, {p.base:.1f} PPG)" for p in players)
 
@@ -86,7 +108,7 @@ def lineup_table(title, impact):
             "After": f"{after_who} ({after:.1f})",
             "Change": f"{after - before:+.1f}",
         })
-    st.markdown(f"**{title}** · net {impact.delta:+.1f} PPG")
+    st.markdown(f"**{md_escape(title)}** · net {impact.delta:+.1f} PPG")
     st.dataframe(rows, width="stretch", hide_index=True)
 
 
@@ -107,7 +129,7 @@ def render_proposal(t, why_label=None):
             + "\n"
             f"- **Net Mutual Utility:** {t.nmu:+.1f} PPG"
         )
-        st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {t.you_why}\n- **Why it works for them:** {t.them_why}")
+        st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {md_escape(t.you_why)}\n- **Why it works for them:** {md_escape(t.them_why)}")
         with st.expander("Lineup before → after"):
             lineup_table("You", t.mine)
             lineup_table(t.target_name, t.theirs)
@@ -406,10 +428,21 @@ def main():
                 + ("matchup difficulty included" if snapshot.schedule_adjusted
                    else "⚠️ matchup ratings unavailable")
             )
+            st.caption(
+                "Waiver levels used: " + ", ".join(f"{pos} {value:.1f}" for pos, value in snapshot.drv.items())
+            )
             others = {t.name: tid for tid, t in snapshot.teams.items() if tid != team_id}
 
             with st.expander("Your roster by position"):
                 st.dataframe(needs_table(snapshot.teams, snapshot.slots, team_id), width="stretch", hide_index=True)
+            with st.expander("Player values the model uses (yours)"):
+                st.caption(
+                    "PPG = blended season average and projection. Window avg = the next weeks after byes, "
+                    "injuries and matchups. A player only helps a lineup where he beats the waiver level."
+                )
+                st.dataframe(
+                    player_values_table(snapshot.teams[team_id], snapshot.drv), width="stretch", hide_index=True
+                )
 
             target_choice = st.selectbox("Target team", ["Scan every team"] + list(others))
             if target_choice == "Scan every team":
@@ -417,7 +450,7 @@ def main():
                     trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict)
                     total = sum(len(v) for v in trades.values())
                     best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "·")
-                    label = f"{best} {name} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}"
+                    label = f"{best} {md_escape(name)} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}"
                     with st.expander(label, expanded=False):
                         render_tiers(trades)
             else:
