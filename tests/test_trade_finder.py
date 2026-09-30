@@ -368,3 +368,24 @@ def test_why_no_tier_names_the_bar_that_was_missed():
     assert "floor" in why_no_tier(_proposal(4.0, 1.0, tsp=3.5))          # MAI -2.5
     assert "Long Shot" in why_no_tier(_proposal(2.0, 0.3))               # MAI +0.3, needs 3.0+
     assert "Blocked" in why_no_tier(_proposal(2.0, 2.0, blocked=True))
+
+
+# ---- lineup before/after (so the math can be checked by eye)
+
+from trade_finder import lineup_rows  # noqa: E402
+
+
+def test_backup_te_steps_in_when_the_starter_is_traded_and_the_lineup_table_shows_it():
+    me = core("m", [P("Loveland", "TE", 11.0), P("Addison", "WR", 10.4)], te=16.2)
+    target = core("t", [P("Watson", "WR", 16.8)], te=11.8)
+    fillers = [core(f"f{i}", te=13) for i in range(3)]
+    snap = snapshot(me, target, fillers)
+    tc = TradeContext(snap, 1, 2)
+    t = tc.evaluate([p for p in me if p.name == "mTE"], [p for p in target if p.name == "Watson"])
+    tc.attach_lineups(t)
+    before = {slot_who: pts for slot, slot_who, pts in t.mine.lineup_before if slot == "TE"}
+    after = {slot_who: pts for slot, slot_who, pts in t.mine.lineup_after if slot == "TE"}
+    assert before == {"mTE": 16.2}
+    assert after == {"Loveland": 11.0}       # Loveland plays TE, not a waiver pickup
+    # so losing Bowers costs 16.2 - 11.0 at TE, not 16.2 - the waiver TE
+    assert abs((11.0 - 16.2) - (-5.2)) < 1e-9
