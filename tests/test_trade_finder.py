@@ -362,8 +362,8 @@ def _proposal(mine_delta, theirs_delta, blocked=False, **penalties):
 
 def test_why_no_tier_names_the_bar_that_was_missed():
     # Bowers-for-Watson shape: easy for them (MAI +2.1) but only +0.4 for you
-    msg = why_no_tier(_proposal(0.4, 2.1))
-    assert "+2.1" in msg and "+0.4" in msg and "1.0" in msg and "Worth a Shot" in msg
+    msg = why_no_tier(_proposal(0.2, 2.1))
+    assert "+2.1" in msg and "+0.2" in msg and "0.3" in msg and "Worth a Shot" in msg
     assert "hurts" in why_no_tier(_proposal(-1.0, 3.0)) or "doesn't improve your lineup" in why_no_tier(_proposal(-1.0, 3.0))
     assert "gets worse" in why_no_tier(_proposal(2.0, -0.5))
     assert "floor" in why_no_tier(_proposal(4.0, 1.0, tsp=3.5))          # MAI -2.5
@@ -421,7 +421,7 @@ def test_empty_result_explains_itself_and_offers_the_closest_misses():
     assert sum(result.funnel[k] for k in result.funnel if k != "checked") == result.funnel["checked"]
     for t in result.near_misses:
         assert t.tier is None and not t.blocked and t.theirs.delta >= 0 and t.mine.delta > 0
-        assert t.mai >= 0.5 and t.lat == 0 and t.my_effective_gain >= 0.2      # acceptable, not lateral, a real edge
+        assert t.mai >= -1.5 and t.lat == 0 and t.my_effective_gain >= 0.2      # plausible, not lateral, a real edge
         assert t.you_why and why_no_tier(t)
 
 

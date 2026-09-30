@@ -84,6 +84,7 @@ STRICT_MIN_MAI = 1.5         # the "strict acceptance" filter: only trades the t
 
 # ---- Tiers: (min target MAI, max target MAI (exclusive, None = open), min your dLineup)
 WIN_WIN = ("Win-Win", 2.0, None, 1.5)
+DEFAULT_MIN_GAIN = 0.3            # your smallest gain for a Worth a Shot trade unless the slider says otherwise
 WORTH_A_SHOT = ("Worth a Shot", 0.5, 2.0, 1.0)
 LONG_SHOT = ("Long Shot", -1.5, 0.5, 3.0)
 TIERS = ["Win-Win", "Worth a Shot", "Long Shot"]
@@ -168,6 +169,7 @@ class TradeProposal:
     lat: float = 0.0
     tfl: float = 0.0
     sell_low: float = 0.0            # you'd be selling a much better player for a lesser one
+    min_gain: float = DEFAULT_MIN_GAIN   # the smallest gain for you that this evaluation treated as Worth a Shot
     real_in_players: List[PlayerValue] = field(default_factory=list)   # players the target receives who would start for it
     real_in: int = 0                 # ... and how many
     real_out: int = 0                # players the target gives who are starters or beat one
@@ -469,7 +471,7 @@ class Side:
 class TradeContext:
     """Everything about one (you, target) pair that doesn't change between candidate trades"""
 
-    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int, min_gain: float = WORTH_A_SHOT[3]):
+    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int, min_gain: float = DEFAULT_MIN_GAIN):
         self.snapshot = snapshot
         self.min_gain = min_gain     # your smallest gain for a Worth a Shot trade (PPG)
         self.n = len(snapshot.weeks)
@@ -646,7 +648,7 @@ class TradeContext:
             receive=list(receive),
             mine=mine,
             theirs=theirs,
-            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl, sell_low=sell_low, real_in=len(real_in), real_out=len(real_out), real_in_players=real_in,
+            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl, sell_low=sell_low, min_gain=self.min_gain, real_in=len(real_in), real_out=len(real_out), real_in_players=real_in,
             alpha_assets=alpha,
             notes=_notes(send, receive),
         )
@@ -721,12 +723,12 @@ def why_no_tier(t: TradeProposal) -> str:
     if mai >= WIN_WIN[1]:
         return (
             f"It's easy for them to accept (MAI {mai:+.1f}), but your gain of {mine:+.1f} PPG is below "
-            f"the {WORTH_A_SHOT[3]:.1f} needed for Worth a Shot ({WIN_WIN[3]:.1f} for Win-Win)."
+            f"the {t.min_gain:.1f} needed for Worth a Shot ({WIN_WIN[3]:.1f} for Win-Win)."
         )
     if mai >= WORTH_A_SHOT[1]:
         return (
             f"Their MAI is fine ({mai:+.1f}), but your gain of {mine:+.1f} PPG is below the "
-            f"{WORTH_A_SHOT[3]:.1f} needed for Worth a Shot."
+            f"{t.min_gain:.1f} needed for Worth a Shot."
         )
     return (
         f"Their MAI is only {mai:+.1f}, which makes it a Long Shot at best, and a Long Shot needs a "
@@ -746,7 +748,7 @@ def _notes(send, receive) -> List[str]:
 
 # ------------------------------------------------------------------ generation
 
-NEAR_MISS_LIMIT = 3
+NEAR_MISS_LIMIT = 5
 NEAR_MISS_MIN_GAIN = 0.2      # smaller than this isn't an edge worth a trade
 
 
@@ -796,7 +798,7 @@ def generate_trades(
     target_id: int,
     strict: bool = False,
     per_tier: int = PER_TIER,
-    min_gain: float = WORTH_A_SHOT[3],
+    min_gain: float = DEFAULT_MIN_GAIN,
 ) -> TradeResults:
     """Proposals in each acceptance tier for one target team, best mutual utility first.
 
@@ -830,9 +832,13 @@ def generate_trades(
                 funnel["checked"] += 1
                 reason = _funnel_reason(t)
                 funnel[reason] += 1
-                # a near miss is a trade they'd plausibly accept that gives you a small but real edge;
-                # lateral same-position swaps are never worth suggesting
-                if reason == "your_gain_too_small" and t.lat == 0 and t.my_effective_gain >= NEAR_MISS_MIN_GAIN:
+                # a near miss is a plausible trade (fair for them, or a stretch that isn't crazy) that gives you
+                # a small but real edge. Lateral same-position swaps and sell-low trades never qualify.
+                if (
+                    reason in ("your_gain_too_small", "stretch_for_them")
+                    and t.lat == 0
+                    and t.my_effective_gain >= NEAR_MISS_MIN_GAIN
+                ):
                     misses.append(t)
                 if t.tier is None or (strict and t.mai < STRICT_MIN_MAI):
                     continue
@@ -871,9 +877,11 @@ def generate_trades(
     return result
 
 
-def evaluate_custom(snapshot: LeagueSnapshot, my_id: int, target_id: int, send, receive) -> TradeProposal:
+def evaluate_custom(
+    snapshot: LeagueSnapshot, my_id: int, target_id: int, send, receive, min_gain: float = DEFAULT_MIN_GAIN
+) -> TradeProposal:
     """Score a specific trade you typed in (same math as the generated ones)"""
-    tc = TradeContext(snapshot, my_id, target_id)
+    tc = TradeContext(snapshot, my_id, target_id, min_gain=min_gain)
     t = tc.evaluate(list(send), list(receive))
     t.you_why, t.them_why = explain(t)
     tc.attach_lineups(t)

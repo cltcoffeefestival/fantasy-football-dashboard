@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    FUNNEL_LABELS, PENALTY_LABELS, positions_fixed, why_no_tier,
+    DEFAULT_MIN_GAIN, FUNNEL_LABELS, PENALTY_LABELS, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -151,7 +151,7 @@ def render_misses(trades):
         st.caption("Nothing cleared a tier. " + "; ".join(parts) + ".")
     if trades.near_misses:
         with st.expander(f"Closest misses ({len(trades.near_misses)})", expanded=total == 0):
-            st.caption("Trades they would likely accept, but your gain is below the bar for a tier. Worth a look if you'd take a small edge.")
+            st.caption("Plausible trades that don't clear a tier: fair or a stretch for them, and a small edge for you. Each says what it missed.")
             for t in trades.near_misses:
                 st.markdown(f"⚪ {why_no_tier(t)}")
                 render_proposal(t)
@@ -428,7 +428,7 @@ def main():
             weeks_ahead = st.slider("Weeks to look ahead", 1, 6, WEEKS_AHEAD)
         with c2:
             min_gain = st.slider(
-                "Smallest gain for you (PPG)", 0.0, 2.0, 0.5, 0.1,
+                "Smallest gain for you (PPG)", 0.0, 2.0, DEFAULT_MIN_GAIN, 0.1,
                 help="The smallest lineup gain for you that still counts as Worth a Shot. Lower it to see more trades.",
             )
             strict = st.toggle(
@@ -506,6 +506,7 @@ def main():
                     snapshot, team_id, others[eval_target],
                     [p for p in mine if p.name in send_names],
                     [p for p in theirs if p.name in recv_names],
+                    min_gain=min_gain,
                 )
                 icon = TIER_STYLE[t.tier][0] if t.tier else "⛔"
                 st.markdown(f"{icon} **{t.tier or 'Does not clear any tier'}**")
