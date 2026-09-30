@@ -117,7 +117,7 @@ def test_plt_when_target_surrenders_qb1_without_a_starting_replacement():
     # target gets a non-QB back: PLT = QB1 PPG - waiver DRV
     snap2 = pair([P("aWR", "WR", 13)], [], qb=17)
     t2 = evaluate(snap2, ["aWR"], ["tQB"])
-    assert abs(t2.plt - (20 - FALLBACK_DRV["QB"])) < 1e-9
+    assert abs(t2.plt - PLT_QB_TE_RATE * (20 - FALLBACK_DRV["QB"])) < 1e-9
 
 
 def test_mai_is_delta_lineup_minus_the_penalties():
@@ -171,7 +171,7 @@ def test_strict_mode_only_returns_trades_the_target_clearly_clears():
 # ---- calibration against real outcomes (7 of 7 multi-player offers rejected, 1-for-1s entertained)
 
 from trade_finder import (  # noqa: E402
-    AP_PENALTY, LATERAL_TAX, QB_GAIN_HAIRCUT, TAP_PACKAGE_MULT, VOID_RATE,
+    AP_PENALTY, LATERAL_TAX, PLT_QB_TE_RATE, QB_GAIN_HAIRCUT, TAP_PACKAGE_MULT, VOID_RATE,
 )
 
 
@@ -244,3 +244,50 @@ def test_qb_upgrades_count_half_for_the_target_in_one_qb_leagues():
     qb_gain = 21 - 14
     assert abs((t.theirs.delta - t.theirs.perceived) - QB_GAIN_HAIRCUT * qb_gain) < 0.75
     assert t.theirs.perceived < t.theirs.delta
+
+
+# ---- talent floor, candidate pools and replacement level
+
+from trade_finder import TALENT_FLOOR_RATIO, TALENT_GAP_RATE, fetch_drv  # noqa: E402
+
+
+def test_talent_floor_penalizes_trading_a_clearly_better_player_for_a_lesser_one():
+    snap = league_with([P("mWR3", "WR", 12.0)], [P("tWR3", "WR", 15.0)], star_league=False)
+    t = evaluate(snap, ["mWR3"], ["tWR3"])           # target hands over the 15, gets the 12
+    assert 12.0 < TALENT_FLOOR_RATIO * 15.0
+    assert abs(t.tfl - TALENT_GAP_RATE * (15.0 - 12.0)) < 1e-9
+    even = evaluate(snap, ["mWR2"], ["tWR2"])         # 12 for 12
+    assert even.tfl == 0.0
+
+
+def test_generation_never_picks_kickers_defenses_or_ir_players():
+    me = core("m", [P("mWR3", "WR", 13), P("mIR", "RB", 18)])
+    for p in me:
+        if p.name == "mIR":
+            p.injury = "INJURY_RESERVE"
+    target = core("t", [P("tWR3", "WR", 15)])
+    result = generate_trades(snapshot(me, target), 1, 2)
+    for proposals in result.values():
+        for t in proposals:
+            for p in t.send + t.receive:
+                assert p.position not in ("K", "D/ST") and p.injury != "INJURY_RESERVE"
+
+
+class _FA:
+    def __init__(self, pts, status="ACTIVE"):
+        self.avg_points, self.projected_avg_points, self.total_points, self.injuryStatus = pts, pts, pts * 4, status
+
+
+class _League:
+    def __init__(self, pts_by_pos):
+        self.pts_by_pos = pts_by_pos
+
+    def free_agents(self, week=None, size=25, position=None):
+        return [_FA(v, s) for v, s in self.pts_by_pos[position]]
+
+
+def test_replacement_level_averages_the_top_three_healthy_free_agents():
+    pts = {pos: [(1.0, "ACTIVE")] for pos in FALLBACK_DRV}
+    pts["WR"] = [(30.0, "OUT"), (12.0, "ACTIVE"), (10.0, "ACTIVE"), (8.0, "ACTIVE"), (2.0, "ACTIVE")]
+    drv, live = fetch_drv(_League(pts), 5)
+    assert abs(drv["WR"] - 10.0) < 1e-9 and live

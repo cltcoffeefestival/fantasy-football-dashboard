@@ -16,6 +16,7 @@ Target side     MAI = dLineup(target) - TAP - BCP - TSP - PLT
          starter, minus the waiver pickup, when it surrenders him without a starter back at the position.
     AP   Asymmetry Penalty: the target surrenders 2+ starters for fewer starters plus a bench piece.
     LAT  Lateral tax: same-position swaps. Also, QB upgrades count half in the target's lineup change.
+    TFL  Talent floor: the best player the target gets must be close to the best it gives up.
 Mutual       NMU = dLineup(you) + MAI. Tiers require both sides to clear a bar.
 
 A slot no rostered player can fill (or beat) is filled by the top waiver pickup at that position
@@ -68,6 +69,12 @@ AP_PENALTY = 3.0                  # target surrenders 2+ starters for fewer star
 TAP_PACKAGE_MULT = 2.0            # Alpha tax doubles when it's a depth package for the star
 VOID_RATE = 0.5                   # surrendering a premier (S-tier) starter with no starter back at the position
 LATERAL_TAX = 1.5                 # same-position swaps give the target no reason to bother
+PLT_QB_TE_RATE = 0.5              # lost QB1/TE1: the lineup change already charges the loss, so this is extra
+TALENT_FLOOR_RATIO = 0.85         # the best player the target gets should be within 15% of its best player out
+TALENT_GAP_RATE = 0.5             # PPG penalty per PPG of talent gap beyond that
+TALENT_GAP_HOLE_RATE = 0.25       # gentler when a different position's real hole is being filled
+DRV_TOP_N = 3                     # replacement level = average of the best few free agents, not the single best
+NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
 QB_GAIN_HAIRCUT = 0.5             # owners discount QB upgrades in 1QB leagues: waiver QBs are plentiful
 # S-tier (Tier-1 Alpha) = top N rostered players at the position across the league
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}
@@ -151,6 +158,7 @@ class TradeProposal:
     plt: float
     ap: float = 0.0
     lat: float = 0.0
+    tfl: float = 0.0
     alpha_assets: List[PlayerValue] = field(default_factory=list)
     tier: Optional[str] = None
     notes: List[str] = field(default_factory=list)
@@ -160,7 +168,7 @@ class TradeProposal:
     @property
     def mai(self) -> float:
         """Manager Acceptance Index: how likely the target is to say yes"""
-        return self.theirs.perceived - self.tap - self.bcp - self.tsp - self.plt - self.ap - self.lat
+        return self.theirs.perceived - self.tap - self.bcp - self.tsp - self.plt - self.ap - self.lat - self.tfl
 
     @property
     def my_gain(self) -> float:
@@ -184,7 +192,7 @@ class TradeProposal:
     def penalties(self) -> List[Tuple[str, float]]:
         """Friction penalties that actually apply"""
         named = [("TAP", self.tap), ("BCP", self.bcp), ("TSP", self.tsp), ("PLT", self.plt),
-                 ("AP", self.ap), ("LAT", self.lat)]
+                 ("AP", self.ap), ("LAT", self.lat), ("TFL", self.tfl)]
         return [(n, v) for n, v in named if v]
 
 
@@ -517,7 +525,7 @@ class TradeContext:
                 (q.base for q in self.theirs.team.players if id(q) in self.theirs.starters and q.position == p.position),
                 default=0.0,
             ):
-                plt += over                       # starting QB1 / TE1 in a 1QB / 1TE format
+                plt += PLT_QB_TE_RATE * over      # starting QB1 / TE1 in a 1QB / 1TE format
             elif id(p) in self.s_tier:
                 plt += VOID_RATE * over           # a premier starter leaves a real hole
 
@@ -529,6 +537,15 @@ class TradeContext:
 
         lat = LATERAL_TAX if sorted(p.position for p in send) == sorted(p.position for p in receive) else 0.0
 
+        # Talent floor: don't hand over a clearly better player for a lesser one, unless a real
+        # hole at a different position is being filled
+        best_out, best_in = max(p.base for p in receive), max(p.base for p in send)
+        tfl = 0.0
+        if best_in < TALENT_FLOOR_RATIO * best_out:
+            top_out = max(receive, key=lambda p: p.base)
+            fills_other_hole = theirs.solves_hole and any(p.position != top_out.position for p in send)
+            tfl = (TALENT_GAP_HOLE_RATE if fills_other_hole else TALENT_GAP_RATE) * (best_out - best_in)
+
         t = TradeProposal(
             target_id=self.theirs.team.team_id,
             target_name=self.theirs.team.name,
@@ -536,7 +553,7 @@ class TradeContext:
             receive=list(receive),
             mine=mine,
             theirs=theirs,
-            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat,
+            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl,
             alpha_assets=alpha,
             notes=_notes(send, receive),
         )
@@ -592,7 +609,11 @@ def generate_trades(
         return result
 
     def pool(players):
-        return sorted((p for p in players if p.base > 0), key=lambda p: p.base, reverse=True)[:POOL_SIZE]
+        eligible = (
+            p for p in players
+            if p.base > 0 and p.position not in NON_TRADE_POSITIONS and p.injury != "INJURY_RESERVE"
+        )
+        return sorted(eligible, key=lambda p: p.base, reverse=True)[:POOL_SIZE]
 
     my_pool, their_pool = pool(tc.mine.team.players), pool(tc.theirs.team.players)
     candidates: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
@@ -655,7 +676,7 @@ def _upgrade_text(side: SideImpact) -> str:
 
 PENALTY_LABELS = {
     "TAP": "Alpha tax", "BCP": "bench clutter", "TSP": "trade structure",
-    "PLT": "positional loss", "AP": "asymmetry", "LAT": "lateral swap",
+    "PLT": "positional loss", "AP": "asymmetry", "LAT": "lateral swap", "TFL": "talent gap",
 }
 
 
@@ -720,27 +741,29 @@ def _fetch_ratings(league, weeks: List[int]) -> Dict[int, Dict[str, Dict[str, in
 
 
 def fetch_drv(league, week: int) -> Tuple[Dict[str, float], bool]:
-    """Top waiver PPG at each position from the league's actual free agents.
+    """Waiver PPG at each position from the league's actual free agents.
 
-    Returns (drv, live). Positions whose lookup fails fall back to FALLBACK_DRV, and live is
-    False unless every position came from real free agents.
+    The average of the best DRV_TOP_N healthy free agents, so one hot pickup or odd projection
+    can't move every gain and penalty. Returns (drv, live). Positions whose lookup fails fall
+    back to FALLBACK_DRV, and live is False unless every position came from real free agents.
     """
     drv = dict(FALLBACK_DRV)
     live = True
     for pos in FALLBACK_DRV:
         try:
-            best = 0.0
+            values = []
             for fa in league.free_agents(week=week, size=25, position=pos):
                 status = (getattr(fa, "injuryStatus", "") or "ACTIVE").upper()
                 if status in ("OUT", "INJURY_RESERVE", "SUSPENSION"):
                     continue
-                best = max(best, base_points(
+                values.append(base_points(
                     getattr(fa, "avg_points", 0),
                     getattr(fa, "projected_avg_points", 0),
                     getattr(fa, "total_points", 0),
                 ))
-            if best > 0:
-                drv[pos] = best
+            top = sorted((v for v in values if v > 0), reverse=True)[:DRV_TOP_N]
+            if top:
+                drv[pos] = sum(top) / len(top)
             else:
                 live = False
         except Exception as e:
