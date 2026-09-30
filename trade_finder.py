@@ -161,7 +161,7 @@ class TradeProposal:
     ap: float = 0.0
     lat: float = 0.0
     tfl: float = 0.0
-    real_in_players: List[PlayerValue] = field(default_factory=list)   # players the target receives who beat waivers
+    real_in_players: List[PlayerValue] = field(default_factory=list)   # players the target receives who would start for it
     real_in: int = 0                 # ... and how many
     real_out: int = 0                # players the target gives who are starters or beat one
     alpha_assets: List[PlayerValue] = field(default_factory=list)
@@ -552,13 +552,17 @@ class TradeContext:
         if len(send) > len(receive):
             tap *= TAP_PACKAGE_MULT      # a depth package for a star is the classic rejection
         bcp = BCP_RATE * sum(value_over_replacement(p, self.drv) for p in theirs.drops) if len(send) >= 2 else 0.0
-        # structure is judged on real pieces: a bench-level player is a throw-in, not a player
-        real_in = [p for p in send if value_over_replacement(p, self.drv) >= REAL_MARGIN]
+        # Structure is judged on real pieces. What the target receives only counts if it would start
+        # for them: a player who beats a waiver pickup but sits on their bench (Corum behind Warren)
+        # is a throw-in, not a player.
+        real_in = [p for p, _, _ in theirs.upgrades]
         real_out = [
             p for p in receive
             if value_over_replacement(p, self.drv) >= REAL_MARGIN or id(p) in self.theirs.starters
         ]
-        tsp = structure_penalty(len(real_in), len(real_out))
+        # The effective structure can only make things worse: throw-ins the target receives still
+        # clutter its roster, so a 2-for-1 with a bench second piece keeps its nominal penalty.
+        tsp = max(structure_penalty(len(send), len(receive)), structure_penalty(len(real_in), len(real_out)))
 
         # Positional Loss Tax: the target surrenders a starter it can't replace from what comes back
         plt = 0.0
@@ -750,7 +754,7 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         throw_ins = [p.name for p in t.send if p.name not in {q.name for q in t.real_in_players}]
         them.append(
             f"judged on real pieces it's a {t.real_in}-for-{t.real_out} for them"
-            + (f" ({', '.join(throw_ins)} wouldn't beat a waiver pickup)" if throw_ins else "")
+            + (f" ({', '.join(throw_ins)} wouldn't crack their starting lineup)" if throw_ins else "")
         )
     if t.penalties:
         friction = ", ".join(f"{PENALTY_LABELS[name]} -{value:.1f}" for name, value in t.penalties)

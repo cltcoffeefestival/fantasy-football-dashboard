@@ -299,7 +299,8 @@ def test_a_throw_in_below_waiver_level_does_not_count_as_a_player_in_the_structu
     # Bowers + Corum for Wilson + Montgomery: Corum wouldn't beat a waiver RB, so it's really 1-for-2
     me = core("m", [P("Corum", "RB", 8.2)], te=16.2)
     target = core("t", [P("Wilson", "WR", 13.3), P("Montgomery", "RB", 12.7)], te=11.8)
-    t = evaluate(snapshot(me, target), ["mTE", "Corum"], ["Wilson", "Montgomery"])
+    fillers = [core(f"f{i}", te=13) for i in range(3)]      # so a 11.8 TE isn't S-tier
+    t = evaluate(snapshot(me, target, fillers), ["mTE", "Corum"], ["Wilson", "Montgomery"])
     assert (len(t.send), len(t.receive)) == (2, 2)
     assert (t.real_in, t.real_out) == (1, 2)
     assert t.tsp == TSP_TARGET_RECEIVES_FEWER
@@ -327,3 +328,17 @@ def test_a_waiver_filled_slot_names_the_rostered_player_the_model_is_bypassing()
     assert t.theirs.upgrades and t.theirs.upgrades[0][1] is None
     them_why = explain(t)[1]
     assert "tQB" in them_why and "waivers" in them_why
+
+
+def test_a_bench_player_above_waiver_level_is_still_a_throw_in_if_he_would_not_start():
+    # live waiver RB level is 6.3 in this league, so Corum (8.2) beats waivers, but he sits behind
+    # the target's real RBs; only Bowers is a real piece for them: 1-for-2, not 2-for-2
+    me = core("m", [P("Corum", "RB", 8.2)], te=16.2)
+    target = core("t", [P("Wilson", "WR", 13.3), P("Montgomery", "RB", 12.7)], te=11.8)
+    snap = snapshot(me, target, [core(f"f{i}", te=13) for i in range(3)])
+    snap.drv["RB"] = 6.3
+    t = evaluate(snap, ["mTE", "Corum"], ["Wilson", "Montgomery"])
+    assert (t.real_in, t.real_out) == (1, 2)
+    assert t.tsp == TSP_TARGET_RECEIVES_FEWER
+    assert [p.name for p in t.real_in_players] == ["mTE"]
+    assert t.tier is None or t.mai < 0.5      # no longer a Worth a Shot
