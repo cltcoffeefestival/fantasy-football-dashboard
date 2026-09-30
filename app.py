@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    positions_fixed,
+    PENALTY_LABELS, positions_fixed,
 )
 from config import LEAGUES
 import logging
@@ -82,7 +82,7 @@ def render_proposal(t, why_label=None):
 
         fixed = ", ".join(positions_fixed(t.mine)) or "none"
         displaced = ", ".join(f"{p.name} ({p.base:.1f})" for p in displaced_players(t.mine)) or "none"
-        friction = ", ".join(f"{n} −{v:.1f}" for n, v in t.penalties) or "none"
+        friction = ", ".join(f"{PENALTY_LABELS[n]} −{v:.1f}" for n, v in t.penalties) or "none"
         st.markdown(
             "**Impact Breakdown**\n"
             f"- **Your Team:** net starting gain **{t.my_gain:+.1f} PPG** · positions fixed: {fixed} · displaced: {displaced}\n"
@@ -361,7 +361,7 @@ def main():
         st.caption(
             "A trade is only shown when it works for both managers. Your side: net starting-lineup gain. "
             "Their side: Manager Acceptance Index, MAI = ΔLineup − TAP (Alpha tax) − BCP (bench clutter) "
-            "− TSP (trade structure) − PLT (lost QB1/TE1). Net Mutual Utility = your gain + their MAI."
+            "− TSP (trade structure) − PLT (lost starter) − AP (asymmetry) − lateral-swap tax. Net Mutual Utility = your gain + their MAI."
         )
 
         c1, c2 = st.columns(2)

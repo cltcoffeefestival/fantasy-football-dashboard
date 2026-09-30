@@ -12,8 +12,10 @@ Target side     MAI = dLineup(target) - TAP - BCP - TSP - PLT
          when it receives 2+ players.
     TSP  Trade Structure Penalty: 1-for-1 0, 2-for-2 1.0, target receives 2 for 1 -> 1.5,
          target receives 1 for 2 -> 2.5.
-    PLT  Positional Loss Tax: in 1QB/1TE formats, the target's starting QB1/TE1 PPG minus the waiver
-         pickup when it surrenders him without receiving a starting replacement.
+    PLT  Positional Loss Tax: the target's starting QB1/TE1 (1QB/1TE formats) or any premier S-tier
+         starter, minus the waiver pickup, when it surrenders him without a starter back at the position.
+    AP   Asymmetry Penalty: the target surrenders 2+ starters for fewer starters plus a bench piece.
+    LAT  Lateral tax: same-position swaps. Also, QB upgrades count half in the target's lineup change.
 Mutual       NMU = dLineup(you) + MAI. Tiers require both sides to clear a bar.
 
 A slot no rostered player can fill (or beat) is filled by the top waiver pickup at that position
@@ -57,9 +59,16 @@ MATCHUP_POSITIONS = {"QB": "1", "RB": "2", "WR": "3", "TE": "4"}  # ESPN default
 # ---- Target acceptance (MAI)
 TAP_RATE = 0.20              # of the S-tier asset's PPG
 BCP_RATE = 0.5               # of the dropped bench player's value over replacement
-TSP_TWO_FOR_TWO = 1.0
-TSP_TARGET_RECEIVES_MORE = 1.5    # e.g. target receives 2, gives 1
-TSP_TARGET_RECEIVES_FEWER = 2.5   # e.g. target receives 1, gives 2
+# Calibrated on real outcomes: every multi-player offer we tried was rejected (7 of 7), while the
+# simple 1-for-1s were entertained. Structure friction is therefore much heavier than a bare +/-1.
+TSP_TWO_FOR_TWO = 2.0
+TSP_TARGET_RECEIVES_MORE = 3.0    # e.g. target receives 2, gives 1
+TSP_TARGET_RECEIVES_FEWER = 3.5   # e.g. target receives 1, gives 2
+AP_PENALTY = 3.0                  # target surrenders 2+ starters for fewer starters plus a bench piece
+TAP_PACKAGE_MULT = 2.0            # Alpha tax doubles when it's a depth package for the star
+VOID_RATE = 0.5                   # surrendering a premier (S-tier) starter with no starter back at the position
+LATERAL_TAX = 1.5                 # same-position swaps give the target no reason to bother
+QB_GAIN_HAIRCUT = 0.5             # owners discount QB upgrades in 1QB leagues: waiver QBs are plentiful
 # S-tier (Tier-1 Alpha) = top N rostered players at the position across the league
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}
 STRICT_MIN_MAI = 1.5         # the "strict acceptance" filter: only trades the target clearly clears
@@ -118,6 +127,7 @@ class LeagueSnapshot:
 class SideImpact:
     """What a trade does to one team's starting lineup"""
     delta: float = 0.0                                   # net starting PPG change
+    perceived: float = 0.0                               # delta as an owner sees it (QB upgrades discounted)
     # (incoming starter, starter he displaces or None for a waiver-filled slot, PPG gained at the slot)
     upgrades: List[Tuple[PlayerValue, Optional[PlayerValue], float]] = field(default_factory=list)
     drops: List[PlayerValue] = field(default_factory=list)       # bench players cut to make room
@@ -139,6 +149,8 @@ class TradeProposal:
     bcp: float
     tsp: float
     plt: float
+    ap: float = 0.0
+    lat: float = 0.0
     alpha_assets: List[PlayerValue] = field(default_factory=list)
     tier: Optional[str] = None
     notes: List[str] = field(default_factory=list)
@@ -148,7 +160,7 @@ class TradeProposal:
     @property
     def mai(self) -> float:
         """Manager Acceptance Index: how likely the target is to say yes"""
-        return self.theirs.delta - self.tap - self.bcp - self.tsp - self.plt
+        return self.theirs.perceived - self.tap - self.bcp - self.tsp - self.plt - self.ap - self.lat
 
     @property
     def my_gain(self) -> float:
@@ -171,7 +183,8 @@ class TradeProposal:
     @property
     def penalties(self) -> List[Tuple[str, float]]:
         """Friction penalties that actually apply"""
-        named = [("TAP", self.tap), ("BCP", self.bcp), ("TSP", self.tsp), ("PLT", self.plt)]
+        named = [("TAP", self.tap), ("BCP", self.bcp), ("TSP", self.tsp), ("PLT", self.plt),
+                 ("AP", self.ap), ("LAT", self.lat)]
         return [(n, v) for n, v in named if v]
 
 
@@ -372,11 +385,21 @@ def structure_penalty(received: int, sent: int) -> float:
     return TSP_TARGET_RECEIVES_MORE if received > sent else TSP_TARGET_RECEIVES_FEWER
 
 
+def single_slot_ppg(players: List[PlayerValue], pos: str, drv: Dict[str, float], n_weeks: int) -> float:
+    """PPG of the lone starter at a one-slot position: best rostered player or the waiver pickup"""
+    total = 0.0
+    for w in range(n_weeks):
+        best = max((p.weekly[w] for p in players if p.position == pos), default=0.0)
+        total += max(best, drv.get(pos, 0.0))
+    return total / n_weeks
+
+
 class Side:
     """One team's pre-trade lineup facts"""
 
     def __init__(self, team: TeamSnapshot, tc: "TradeContext"):
         self.team = team
+        self.qb_before = single_slot_ppg(team.players, "QB", tc.drv, tc.n) if "QB" in tc.single else 0.0
         self.before = lineup_ppg(team.players, tc.ctx, tc.n)
         self.starters = starter_ids(team.players, tc.ctx, tc.n)
         # cheapest to cut first: bench before starters, then lowest value over replacement
@@ -424,6 +447,10 @@ class TradeContext:
         ] + [p for p in incoming if id(p) not in excluded_ids]
         # excluded players are still rostered (bench), they just can't start
         delta = lineup_ppg(roster, self.ctx, self.n) - side.before
+        perceived = delta
+        if "QB" in self.single:
+            qb_gain = max(0.0, single_slot_ppg(roster, "QB", self.drv, self.n) - side.qb_before)
+            perceived = delta - QB_GAIN_HAIRCUT * qb_gain
 
         post_starters = starter_ids(roster, self.ctx, self.n)
         incoming_starters = [p for p in incoming if id(p) in post_starters]
@@ -438,6 +465,7 @@ class TradeContext:
 
         return SideImpact(
             delta=delta,
+            perceived=perceived,
             upgrades=upgrades,
             drops=drops,
             lost_starters=lost,
@@ -472,20 +500,34 @@ class TradeContext:
         theirs = self._side_impact(self.theirs, self.their_weak, receive, send)
 
         alpha = [p for p in receive if id(p) in self.s_tier]
-        tap = TAP_RATE * max(p.base for p in alpha) if alpha else 0.0
+        tap = TAP_RATE * sum(p.base for p in alpha)
+        if len(send) > len(receive):
+            tap *= TAP_PACKAGE_MULT      # a depth package for a star is the classic rejection
         bcp = BCP_RATE * sum(value_over_replacement(p, self.drv) for p in theirs.drops) if len(send) >= 2 else 0.0
         tsp = structure_penalty(len(send), len(receive))
 
-        # Positional Loss Tax: surrendering QB1/TE1 with no starting replacement coming back
+        # Positional Loss Tax: the target surrenders a starter it can't replace from what comes back
         plt = 0.0
         incoming_starter_positions = {p.position for p, _, _ in theirs.upgrades}
-        for pos in self.single:
-            top = max(
-                (p for p in self.theirs.team.players if id(p) in self.theirs.starters and p.position == pos),
-                key=lambda p: p.base, default=None,
-            )
-            if top is not None and id(top) in recv_ids and pos not in incoming_starter_positions:
-                plt += max(0.0, top.base - self.drv.get(pos, 0.0))
+        for p in receive:
+            if id(p) not in self.theirs.starters or p.position in incoming_starter_positions:
+                continue
+            over = max(0.0, p.base - self.drv.get(p.position, 0.0))
+            if p.position in self.single and p.base >= max(
+                (q.base for q in self.theirs.team.players if id(q) in self.theirs.starters and q.position == p.position),
+                default=0.0,
+            ):
+                plt += over                       # starting QB1 / TE1 in a 1QB / 1TE format
+            elif id(p) in self.s_tier:
+                plt += VOID_RATE * over           # a premier starter leaves a real hole
+
+        surrendered_starters = [p for p in receive if id(p) in self.theirs.starters]
+        incoming_starters = [p for p, _, _ in theirs.upgrades]
+        ap = AP_PENALTY if (
+            len(surrendered_starters) >= 2 and len(send) >= 2 and len(incoming_starters) < len(surrendered_starters)
+        ) else 0.0
+
+        lat = LATERAL_TAX if sorted(p.position for p in send) == sorted(p.position for p in receive) else 0.0
 
         t = TradeProposal(
             target_id=self.theirs.team.team_id,
@@ -494,7 +536,7 @@ class TradeContext:
             receive=list(receive),
             mine=mine,
             theirs=theirs,
-            tap=tap, bcp=bcp, tsp=tsp, plt=plt,
+            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat,
             alpha_assets=alpha,
             notes=_notes(send, receive),
         )
@@ -611,6 +653,12 @@ def _upgrade_text(side: SideImpact) -> str:
     return "; ".join(parts)
 
 
+PENALTY_LABELS = {
+    "TAP": "Alpha tax", "BCP": "bench clutter", "TSP": "trade structure",
+    "PLT": "positional loss", "AP": "asymmetry", "LAT": "lateral swap",
+}
+
+
 def explain(t: TradeProposal) -> Tuple[str, str]:
     """(why it works for you, why it works for them)"""
     you = []
@@ -632,7 +680,7 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
     else:
         them.append(f"their lineup changes by {t.theirs.delta:+.1f} PPG")
     if t.penalties:
-        friction = ", ".join(f"{name} -{value:.1f}" for name, value in t.penalties)
+        friction = ", ".join(f"{PENALTY_LABELS[name]} -{value:.1f}" for name, value in t.penalties)
         them.append(f"friction they'll feel: {friction}")
     else:
         them.append("no friction penalties apply")

@@ -166,3 +166,81 @@ def test_strict_mode_only_returns_trades_the_target_clearly_clears():
     target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tTE2", "TE", 6.0)])
     result = generate_trades(snapshot(me, target), 1, 2, strict=True)
     assert all(t.mai >= 1.5 for ps in result.values() for t in ps)
+
+
+# ---- calibration against real outcomes (7 of 7 multi-player offers rejected, 1-for-1s entertained)
+
+from trade_finder import (  # noqa: E402
+    AP_PENALTY, LATERAL_TAX, QB_GAIN_HAIRCUT, TAP_PACKAGE_MULT, VOID_RATE,
+)
+
+
+def league_with(me_extra, target_extra, me_kw=None, target_kw=None, star_league=True):
+    """Two teams plus mediocre filler so a 22+ PPG player is S-tier"""
+    fillers = [core(f"f{i}", [P(f"fw{i}", "WR", 10 + i * 0.1)]) for i in range(4)] if star_league else []
+    return snapshot(core("m", me_extra, **(me_kw or {})), core("t", target_extra, **(target_kw or {})), fillers)
+
+
+def test_one_for_one_cross_position_trade_that_fills_both_holes_is_win_win():
+    # Dobbins-for-Worthy / Saquon-for-Davante shape: simple, balanced, cross-positional
+    me = core("m", [P("mRB3", "RB", 13), P("mRB4", "RB", 12.5)])
+    for p in me:
+        if p.name == "mRB2":
+            p.weekly[:], p.base = [14.0] * WEEKS, 14.0     # RBs 15/14 + flex 13 start, RB4 sits
+        if p.name == "mWR2":
+            p.weekly[:], p.base = [9.0] * WEEKS, 9.0       # my hole
+    target = core("t", [P("tWR3", "WR", 11.5)])
+    for p in target:
+        if p.name == "tRB2":
+            p.weekly[:], p.base = [8.0] * WEEKS, 8.0       # their hole
+    fillers = [core(f"f{i}", [P(f"fw{i}", "WR", 10 + i * 0.1)]) for i in range(4)]
+    t = evaluate(snapshot(me, target, fillers), ["mRB4"], ["tWR3"])
+    assert t.tsp == 0.0 and t.lat == 0.0 and t.tap == 0.0
+    assert t.mine.delta >= 1.5 and t.mai >= 2.0 and t.tier == "Win-Win"
+
+
+def test_depth_package_for_a_tier_one_asset_is_taxed_double():
+    snap = league_with([P("mRB3", "RB", 14), P("mRB4", "RB", 13)], [P("Star", "WR", 22)])
+    t = evaluate(snap, ["mRB3", "mRB4"], ["Star"])          # Stevenson + Olave -> A.J. Brown
+    assert abs(t.tap - TAP_RATE * 22 * TAP_PACKAGE_MULT) < 1e-9
+    assert t.tier != "Win-Win"
+
+
+def test_asking_two_alpha_assets_for_one_player_is_not_offered():
+    snap = league_with([P("mAllen", "QB", 24)], [P("Chase", "WR", 22), P("Mitchell", "RB", 23)], me_kw={"qb": 21})
+    t = evaluate(snap, ["mAllen"], ["Chase", "Mitchell"])   # Allen -> Chase + Mitchell
+    assert t.tap > 8 and t.tier is None
+
+
+def test_lateral_same_position_swap_pays_the_why_bother_tax():
+    snap = league_with([P("mRB3", "RB", 13), P("mRB4", "RB", 12.5)], [P("tRB3", "RB", 13), P("tRB4", "RB", 12.5)])
+    t = evaluate(snap, ["mRB3", "mRB4"], ["tRB3", "tRB4"])  # Skattebo + Dobbins -> Warren + Mitchell
+    assert t.lat == LATERAL_TAX and t.tier != "Win-Win"
+    assert evaluate(snap, ["mRB3"], ["tRB3"]).lat == LATERAL_TAX
+
+
+def test_surrendering_a_premier_wr_without_a_wr_back_leaves_a_taxed_hole():
+    snap = league_with([P("mQB2", "QB", 20)], [P("Waddle", "WR", 22)], star_league=True)
+    t = evaluate(snap, ["mQB2"], ["Waddle"])                # Kyler + LaPorta -> Waddle + Likely shape
+    assert t.plt >= VOID_RATE * (22 - FALLBACK_DRV["WR"]) - 1e-9
+
+
+def test_asymmetry_when_target_gives_two_starters_for_one_starter_plus_a_bench_piece():
+    snap = league_with([P("Good", "WR", 18), P("Scrub", "WR", 8.0)], [P("T1", "WR", 15), P("T2", "WR", 14.5)])
+    t = evaluate(snap, ["Good", "Scrub"], ["T1", "T2"])     # Douglas + Waddle -> Harrison + Etienne shape
+    assert t.ap == AP_PENALTY and t.tier != "Win-Win"
+
+
+def test_two_for_one_and_two_for_two_never_reach_win_win():
+    snap = league_with([P("mRB3", "RB", 14), P("mRB4", "RB", 13)], [P("tWR3", "WR", 14), P("tWR4", "WR", 13)])
+    for send, recv in ((["mRB3", "mRB4"], ["tWR3"]), (["mRB3", "mRB4"], ["tWR3", "tWR4"]), (["mRB3"], ["tWR3", "tWR4"])):
+        assert evaluate(snap, send, recv).tier != "Win-Win"
+    assert evaluate(snap, ["mRB3", "mRB4"], ["tWR3"]).tsp == TSP_TARGET_RECEIVES_MORE
+
+
+def test_qb_upgrades_count_half_for_the_target_in_one_qb_leagues():
+    snap = league_with([P("mQB2", "QB", 21)], [], target_kw={"qb": 14})
+    t = evaluate(snap, ["mQB2"], ["tRB2"])
+    qb_gain = 21 - 14
+    assert abs((t.theirs.delta - t.theirs.perceived) - QB_GAIN_HAIRCUT * qb_gain) < 0.75
+    assert t.theirs.perceived < t.theirs.delta
