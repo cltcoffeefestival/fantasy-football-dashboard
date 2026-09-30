@@ -7,7 +7,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
-from trade_finder import build_league_snapshot, find_trades, needs_table, WEEKS_AHEAD
+from trade_finder import (
+    TIERS, WEEKS_AHEAD, MIN_MY_GAIN, build_league_snapshot, evaluate_custom, generate_trades, needs_table,
+)
 from config import LEAGUES
 import logging
 from pathlib import Path
@@ -55,38 +57,51 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
     return build_league_snapshot(_lm.leagues[league_name], weeks_ahead)
 
 
-TIER_ICONS = {"Win-win": "🟢", "Worth a shot": "🟡", "Long shot": "🟠"}
+@st.cache_data(ttl=300, show_spinner="Scanning rosters, free agents and schedules...")
+def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, min_my_gain):
+    """Trade proposals for one target team (the snapshot underneath is cached too)"""
+    snapshot = cached_snapshot(_lm, league_name, weeks_ahead)
+    return generate_trades(snapshot, my_id, target_id, min_my_gain=min_my_gain)
 
 
-def format_players(players, info):
-    """Player line with their role on their current team and what they're worth there"""
-    parts = []
-    for p, (role, value) in zip(players, info):
-        flag = f" ⚠️ {p.injury.replace('_', ' ').title()}" if p.injured else ""
-        if role == "Starter":
-            detail = f"{p.position} · Starter · {value:.1f} pts/wk"
-        else:
-            detail = f"{p.position} · Bench · {p.base:.1f} avg, adds {value:.1f} pts/wk"
-        parts.append(f"**{p.name}** ({detail}){flag}")
-    return " + ".join(parts)
+TIER_STYLE = {
+    "Win-Win": ("🟢", "WIN-WIN PROPOSALS (High Probability)", "Why They Accept"),
+    "Worth a Shot": ("🟡", "WORTH A SHOT PROPOSALS (Medium Probability)", "Why They Might Accept / Hesitate"),
+    "Long Shot": ("🔴", "LONG SHOT PROPOSALS (Aggressive / High-Reward)", "Why It's a Long Shot & How to Pitch It"),
+}
 
 
-def render_trade(t):
-    """One trade card"""
+def names(players):
+    return " + ".join(f"**{p.name}** ({p.position}, {p.base:.1f} PPG)" for p in players)
+
+
+def render_mai_breakdown(t):
+    st.caption(
+        f"MAI = ΔLineup {t.delta_lineup:+.1f} − TAP {t.tap:.1f} − BCP {t.bcp:.1f} "
+        f"− TSP {t.tsp:.1f} − AP {t.ap:.1f} · your lineup {t.my_gain:+.1f} PPG"
+    )
+    for note in t.notes:
+        st.caption(f"⚠️ {note}")
+    if t.my_drops:
+        st.caption("You would cut: " + ", ".join(p.name for p in t.my_drops))
+
+
+def render_proposal(t, why_label):
     with st.container(border=True):
-        st.markdown(f"{TIER_ICONS[t.tier]} **{t.tier}**")
-        st.markdown(f"You give: {format_players(t.give, t.give_info)}")
-        st.markdown(f"You get: {format_players(t.get, t.get_info)}")
-        m1, m2 = st.columns(2)
-        m1.metric("Your net lineup impact", f"{t.my_gain:+.1f} pts/wk")
-        m2.metric(f"{t.partner_name} net lineup impact", f"{t.their_gain:+.1f} pts/wk")
-        st.caption(
-            f"Starting points per week: you {t.my_before:.1f} → {t.my_after:.1f} · "
-            f"{t.partner_name} {t.their_before:.1f} → {t.their_after:.1f}"
-        )
-        st.caption(f"Trade value: you give {t.give_value:.0f} · you get {t.get_value:.0f}")
-        for note in t.notes:
-            st.caption(f"⚠️ {note}")
+        st.markdown(f"**Proposed Trade:** You send {names(t.send)} ↔ You receive {names(t.receive)}")
+        st.markdown(f"**Target MAI Score:** {t.mai:+.1f} PPG")
+        st.markdown(f"**{why_label}:** {t.why}")
+        render_mai_breakdown(t)
+
+
+def render_tiers(trades):
+    for tier in TIERS:
+        icon, title, why_label = TIER_STYLE[tier]
+        st.markdown(f"##### {icon} {title}")
+        if not trades[tier]:
+            st.caption("No proposal in this tier.")
+        for t in trades[tier]:
+            render_proposal(t, why_label)
 
 
 def record_class(wins, losses):
@@ -339,26 +354,16 @@ def main():
     elif page == "🔁 Trade Finder":
         st.header("🔁 Trade Finder")
         st.caption(
-            "Scans every roster in your league and suggests trades that improve your lineup, "
-            "help the other team enough that they'd say yes, and are roughly even in value. "
-            "Values account for projections, injuries, byes and upcoming matchups."
+            "Every trade is scored from the other manager's side with the Manager Acceptance Index: "
+            "MAI = ΔLineup − TAP (Alpha tax) − BCP (bench clutter) − TSP (trade structure) − AP (asymmetry). "
+            "Higher means they're more likely to say yes."
         )
 
         c1, c2 = st.columns(2)
         with c1:
             weeks_ahead = st.slider("Weeks to look ahead", 1, 6, WEEKS_AHEAD)
         with c2:
-            min_gain = st.slider("Minimum gain for you (pts/week)", 0.5, 5.0, 1.0, 0.5)
-
-        c3, c4 = st.columns(2)
-        with c3:
-            creative = st.toggle(
-                "Include creative / long-shot trades",
-                value=True,
-                help="Adds bigger packages (2-for-2, 3-for-1) and trades the other team may need convincing on.",
-            )
-        with c4:
-            focus = st.multiselect("Only trades that bring back a", ["QB", "RB", "WR", "TE", "D/ST", "K"])
+            min_my_gain = st.slider("Minimum gain for you (PPG)", 0.0, 5.0, MIN_MY_GAIN, 0.5)
 
         snapshot = cached_snapshot(league_manager, league_name, weeks_ahead)
         if team_id not in snapshot.teams:
@@ -366,43 +371,50 @@ def main():
         else:
             st.caption(
                 f"Weeks {snapshot.weeks[0]}–{snapshot.weeks[-1]} · "
+                + ("replacement level from your league's actual free agents" if snapshot.drv_live
+                   else "⚠️ free agent lookup incomplete, using estimated replacement levels")
+                + " · "
                 + ("matchup difficulty included" if snapshot.schedule_adjusted
-                   else "⚠️ matchup ratings unavailable, using byes and injuries only")
+                   else "⚠️ matchup ratings unavailable")
             )
+            others = {t.name: tid for tid, t in snapshot.teams.items() if tid != team_id}
 
-            st.subheader("Your roster by position")
-            st.dataframe(needs_table(snapshot.teams, snapshot.slots, team_id), width="stretch", hide_index=True)
+            with st.expander("Your roster by position"):
+                st.dataframe(needs_table(snapshot.teams, snapshot.slots, team_id), width="stretch", hide_index=True)
 
-            st.subheader("Recommended trades")
-            trades = find_trades(
-                snapshot, team_id, min_gain=min_gain,
-                per_partner=4 if creative else 3, creative=creative, focus_positions=focus,
-            )
+            target_choice = st.selectbox("Target team", ["Scan every team"] + list(others))
+            if target_choice == "Scan every team":
+                for name, tid in others.items():
+                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, min_my_gain)
+                    total = sum(len(v) for v in trades.values())
+                    best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "·")
+                    label = f"{best} {name} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}"
+                    with st.expander(label, expanded=False):
+                        render_tiers(trades)
+            else:
+                render_tiers(cached_trades(
+                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], min_my_gain
+                ))
 
-            # Group by trade partner so every team shows up, best-fitting partners first
-            by_partner = {}
-            for t in trades:
-                by_partner.setdefault(t.partner_id, []).append(t)
-            others = [tm for tid, tm in snapshot.teams.items() if tid != team_id]
-            no_match = [tm.name for tm in others if tm.team_id not in by_partner]
-
-            if not trades:
-                st.info("No trades clear the bar right now. Try lowering the minimum gain or looking further ahead.")
-
-            for rank, (pid, plist) in enumerate(by_partner.items()):
-                partner = snapshot.teams[pid]
-                best = plist[0]
-                title = (
-                    f"{partner.name} ({partner.record}) · {len(plist)} trade{'s' if len(plist) != 1 else ''} · "
-                    f"best: {TIER_ICONS[best.tier]} {best.tier}"
+            st.subheader("Score your own trade")
+            e1, e2 = st.columns(2)
+            with e1:
+                eval_target = st.selectbox("Trade with", list(others), key="eval_target")
+                mine = snapshot.teams[team_id].players
+                send_names = st.multiselect("You send", [p.name for p in mine], key="eval_send")
+            with e2:
+                theirs = snapshot.teams[others[eval_target]].players
+                recv_names = st.multiselect("You receive", [p.name for p in theirs], key="eval_recv")
+            if send_names and recv_names:
+                t = evaluate_custom(
+                    snapshot, team_id, others[eval_target],
+                    [p for p in mine if p.name in send_names],
+                    [p for p in theirs if p.name in recv_names],
                 )
-                with st.expander(title, expanded=rank < 3):
-                    for t in plist:
-                        render_trade(t)
-
-            if no_match:
-                st.caption("No fit found with: " + ", ".join(no_match))
-
+                icon = TIER_STYLE[t.tier][0] if t.tier else "⛔"
+                st.markdown(f"{icon} **{t.tier or 'Below the Long Shot floor (MAI < −1.5)'}** · Target MAI {t.mai:+.1f} PPG")
+                st.markdown(t.why)
+                render_mai_breakdown(t)
 
     # Page: Team Analysis
     elif page == "🤝 Team Analysis":
