@@ -1,21 +1,27 @@
 """
-Trade engine (HATE-G): Human Acceptance Trade Engine & Generator.
+Trade engine (M-HATE): Mutual Need & Human Acceptance Trade Engine.
 
-Every trade is scored from the TARGET manager's perspective with the Manager Acceptance Index:
+A trade is only surfaced when it works for BOTH managers.
 
-    MAI = dLineup - TAP - BCP - TSP - AP
+Your side       dLineup(you) = net change in your optimal starting lineup (PPG). Incoming players count
+                only for what they add over the starter they displace; a redundant second QB/TE
+                (when you already have a top-tier QB1/TE1 in a 1QB/1TE format) counts for 0.
+Target side     MAI = dLineup(target) - TAP - BCP - TSP - PLT
+    TAP  Tier-1 Alpha Premium: 20% of the PPG of an S-tier asset the target surrenders.
+    BCP  Bench Clutter Penalty: half the value over replacement of each bench player the target cuts
+         when it receives 2+ players.
+    TSP  Trade Structure Penalty: 1-for-1 0, 2-for-2 1.0, target receives 2 for 1 -> 1.5,
+         target receives 1 for 2 -> 2.5.
+    PLT  Positional Loss Tax: the target's starting QB1/TE1 (1QB/1TE formats) or any premier S-tier
+         starter, minus the waiver pickup, when it surrenders him without a starter back at the position.
+    AP   Asymmetry Penalty: the target surrenders 2+ starters for fewer starters plus a bench piece.
+    LAT  Lateral tax: same-position swaps. Also, QB upgrades count half in the target's lineup change.
+    TFL  Talent floor: the best player the target gets must be close to the best it gives up.
+Mutual       NMU = dLineup(you) + MAI. Tiers require both sides to clear a bar.
 
-    dLineup  net change in the target's optimal starting lineup (PPG). A slot a rostered player
-             can't beat (bye, injury, empty) is filled by the top waiver pickup at that position
-             (Dynamic Replacement Value, DRV), so incoming players only count for what they add
-             over the starter they displace and lost starters are always charged.
-    TAP      Tier-1 Alpha Premium: 20% of the PPG of an S-tier asset the target surrenders.
-    BCP      Bench Clutter Penalty: half the value over replacement of each bench player the target
-             must cut when it receives more players than it sends.
-    TSP      Trade Structure Penalty: 1.5 when the target receives 2+ for 1, 1.0 for a 2-for-2.
-    AP       Asymmetry Penalty: 3.0 when the target surrenders 2 starters for 1 starter + 1 bench piece.
-
-Trades are grouped by MAI into three acceptance tiers (Win-Win / Worth a Shot / Long Shot).
+A slot no rostered player can fill (or beat) is filled by the top waiver pickup at that position
+(Dynamic Replacement Value, DRV), so lost starters are always charged. Each roster is only ever
+shortened by cutting the cheapest bench players, so roster limits are respected on both sides.
 """
 from dataclasses import dataclass, field
 from itertools import combinations
@@ -51,23 +57,37 @@ INJURY_AVAILABILITY = {
 MATCHUP_SWING = 0.12
 MATCHUP_POSITIONS = {"QB": "1", "RB": "2", "WR": "3", "TE": "4"}  # ESPN defaultPositionId
 
-# ---- Manager Acceptance Index
+# ---- Target acceptance (MAI)
 TAP_RATE = 0.20              # of the S-tier asset's PPG
 BCP_RATE = 0.5               # of the dropped bench player's value over replacement
-TSP_RECEIVES_MORE = 1.5      # target receives more players than it sends (e.g. 2-for-1)
-TSP_TWO_FOR_TWO = 1.0
-AP_PENALTY = 3.0
+# Calibrated on real outcomes: every multi-player offer we tried was rejected (7 of 7), while the
+# simple 1-for-1s were entertained. Structure friction is therefore much heavier than a bare +/-1.
+TSP_TWO_FOR_TWO = 2.0
+TSP_TARGET_RECEIVES_MORE = 3.0    # e.g. target receives 2, gives 1
+TSP_TARGET_RECEIVES_FEWER = 3.5   # e.g. target receives 1, gives 2
+AP_PENALTY = 3.0                  # target surrenders 2+ starters for fewer starters plus a bench piece
+TAP_PACKAGE_MULT = 2.0            # Alpha tax doubles when it's a depth package for the star
+VOID_RATE = 0.5                   # surrendering a premier (S-tier) starter with no starter back at the position
+LATERAL_TAX = 1.5                 # same-position swaps give the target no reason to bother
+PLT_QB_TE_RATE = 0.5              # lost QB1/TE1: the lineup change already charges the loss, so this is extra
+TALENT_FLOOR_RATIO = 0.85         # the best player the target gets should be within 15% of its best player out
+TALENT_GAP_RATE = 0.5             # PPG penalty per PPG of talent gap beyond that
+TALENT_GAP_HOLE_RATE = 0.25       # gentler when a different position's real hole is being filled
+DRV_TOP_N = 3                     # replacement level = average of the best few free agents, not the single best
+NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
+QB_GAIN_HAIRCUT = 0.5             # owners discount QB upgrades in 1QB leagues: waiver QBs are plentiful
 # S-tier (Tier-1 Alpha) = top N rostered players at the position across the league
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}
+STRICT_MIN_MAI = 1.5         # the "strict acceptance" filter: only trades the target clearly clears
 
-WIN_WIN_MIN = 2.0
-WORTH_A_SHOT_MIN = 0.5
-LONG_SHOT_MIN = -1.5
+# ---- Tiers: (min target MAI, max target MAI (exclusive, None = open), min your dLineup)
+WIN_WIN = ("Win-Win", 2.0, None, 1.5)
+WORTH_A_SHOT = ("Worth a Shot", 0.5, 2.0, 1.0)
+LONG_SHOT = ("Long Shot", -1.5, 0.5, 3.0)
 TIERS = ["Win-Win", "Worth a Shot", "Long Shot"]
-PER_TIER = 2
+PER_TIER = 3
 POOL_SIZE = 8                # top players per side considered in a swap
 WEAK_SLOT_MARGIN = 3.0       # a starter within this many PPG of the waiver pickup is a weak slot
-MIN_MY_GAIN = 0.5            # a proposal must be worth sending: at least this much for you (PPG)
 STRENGTH_MARGIN = 0.10       # +/-10% vs. league average starters => strength / weakness
 
 # Used only when the free agent lookup fails: rough full-PPR waiver-wire PPG by position
@@ -111,27 +131,69 @@ class LeagueSnapshot:
 
 
 @dataclass
+class SideImpact:
+    """What a trade does to one team's starting lineup"""
+    delta: float = 0.0                                   # net starting PPG change
+    perceived: float = 0.0                               # delta as an owner sees it (QB upgrades discounted)
+    # (incoming starter, starter he displaces or None for a waiver-filled slot, PPG gained at the slot)
+    upgrades: List[Tuple[PlayerValue, Optional[PlayerValue], float]] = field(default_factory=list)
+    drops: List[PlayerValue] = field(default_factory=list)       # bench players cut to make room
+    lost_starters: List[PlayerValue] = field(default_factory=list)
+    redundant: List[PlayerValue] = field(default_factory=list)   # incoming players that add nothing
+    solves_hole: bool = False                                    # fills a weak slot / weak position
+    blocked: bool = False                                        # gives up starters for a redundant bench piece
+
+
+@dataclass
 class TradeProposal:
     target_id: int
     target_name: str
     send: List[PlayerValue]          # what you send to the target
     receive: List[PlayerValue]       # what the target sends you
-    mai: float
-    delta_lineup: float              # target's net lineup change (PPG)
+    mine: SideImpact
+    theirs: SideImpact
     tap: float
     bcp: float
     tsp: float
-    ap: float
-    my_gain: float                   # your net lineup change (PPG)
-    tier: Optional[str]
-    target_drops: List[PlayerValue] = field(default_factory=list)
-    my_drops: List[PlayerValue] = field(default_factory=list)
-    # (incoming player, starter he displaces or None for a waiver-filled slot, PPG gained at the slot)
-    upgrades: List[Tuple[PlayerValue, Optional[PlayerValue], float]] = field(default_factory=list)
+    plt: float
+    ap: float = 0.0
+    lat: float = 0.0
+    tfl: float = 0.0
     alpha_assets: List[PlayerValue] = field(default_factory=list)
-    solves_deficiency: bool = False
+    tier: Optional[str] = None
     notes: List[str] = field(default_factory=list)
-    why: str = ""
+    you_why: str = ""
+    them_why: str = ""
+
+    @property
+    def mai(self) -> float:
+        """Manager Acceptance Index: how likely the target is to say yes"""
+        return self.theirs.perceived - self.tap - self.bcp - self.tsp - self.plt - self.ap - self.lat - self.tfl
+
+    @property
+    def my_gain(self) -> float:
+        return self.mine.delta
+
+    @property
+    def delta_lineup(self) -> float:
+        """The target's net lineup change"""
+        return self.theirs.delta
+
+    @property
+    def nmu(self) -> float:
+        """Net Mutual Utility: your lineup change plus the target's MAI"""
+        return self.mine.delta + self.mai
+
+    @property
+    def blocked(self) -> bool:
+        return self.mine.blocked or self.theirs.blocked
+
+    @property
+    def penalties(self) -> List[Tuple[str, float]]:
+        """Friction penalties that actually apply"""
+        named = [("TAP", self.tap), ("BCP", self.bcp), ("TSP", self.tsp), ("PLT", self.plt),
+                 ("AP", self.ap), ("LAT", self.lat), ("TFL", self.tfl)]
+        return [(n, v) for n, v in named if v]
 
 
 # ---------------------------------------------------------------- player values
@@ -213,6 +275,21 @@ def build_slots(position_slot_counts: Dict[str, int]) -> List[Tuple[str, frozens
 def slot_context(slots, drv: Dict[str, float]) -> List[Tuple[frozenset, float]]:
     """Each slot with the waiver pickup that would fill it (best DRV among eligible positions)"""
     return [(eligible, max((drv.get(pos, 0.0) for pos in eligible), default=0.0)) for _, eligible in slots]
+
+
+def single_slot_positions(slots) -> set:
+    """Positions in a 1QB / 1TE format.
+
+    QB is single when there is exactly one QB slot and no superflex (OP) slot that could hold a second.
+    TE is single when there is exactly one dedicated TE slot; a flex spot doesn't change that.
+    """
+    result = set()
+    dedicated = {pos: sum(1 for _, elig in slots if elig == frozenset({pos})) for pos in ("QB", "TE")}
+    if dedicated["QB"] == 1 and not any("QB" in elig and len(elig) > 1 for _, elig in slots):
+        result.add("QB")
+    if dedicated["TE"] == 1:
+        result.add("TE")
+    return result
 
 
 def _solve_week(players: List[PlayerValue], ctx, week: int):
@@ -309,14 +386,35 @@ def s_tier_ids(snapshot: LeagueSnapshot) -> set:
     return ids
 
 
-def tier_for(mai: float) -> Optional[str]:
-    if mai >= WIN_WIN_MIN:
-        return "Win-Win"
-    if mai >= WORTH_A_SHOT_MIN:
-        return "Worth a Shot"
-    if mai >= LONG_SHOT_MIN:
-        return "Long Shot"
-    return None
+def structure_penalty(received: int, sent: int) -> float:
+    """TSP from the target's view: it receives `received` players and sends `sent`"""
+    if received == sent:
+        return 0.0 if received == 1 else TSP_TWO_FOR_TWO
+    return TSP_TARGET_RECEIVES_MORE if received > sent else TSP_TARGET_RECEIVES_FEWER
+
+
+def single_slot_ppg(players: List[PlayerValue], pos: str, drv: Dict[str, float], n_weeks: int) -> float:
+    """PPG of the lone starter at a one-slot position: best rostered player or the waiver pickup"""
+    total = 0.0
+    for w in range(n_weeks):
+        best = max((p.weekly[w] for p in players if p.position == pos), default=0.0)
+        total += max(best, drv.get(pos, 0.0))
+    return total / n_weeks
+
+
+class Side:
+    """One team's pre-trade lineup facts"""
+
+    def __init__(self, team: TeamSnapshot, tc: "TradeContext"):
+        self.team = team
+        self.qb_before = single_slot_ppg(team.players, "QB", tc.drv, tc.n) if "QB" in tc.single else 0.0
+        self.before = lineup_ppg(team.players, tc.ctx, tc.n)
+        self.starters = starter_ids(team.players, tc.ctx, tc.n)
+        # cheapest to cut first: bench before starters, then lowest value over replacement
+        self.cut = sorted(
+            team.players,
+            key=lambda p: (id(p) in self.starters, value_over_replacement(p, tc.drv), p.base),
+        )
 
 
 class TradeContext:
@@ -324,121 +422,159 @@ class TradeContext:
 
     def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int):
         self.snapshot = snapshot
-        self.me = snapshot.teams[my_id]
-        self.target = snapshot.teams[target_id]
         self.n = len(snapshot.weeks)
         self.drv = snapshot.drv
         self.ctx = slot_context(snapshot.slots, snapshot.drv)
         self.s_tier = s_tier_ids(snapshot)
+        self.single = single_slot_positions(snapshot.slots)
+        self.mine = Side(snapshot.teams[my_id], self)
+        self.theirs = Side(snapshot.teams[target_id], self)
 
-        self.my_before = lineup_ppg(self.me.players, self.ctx, self.n)
-        self.target_before = lineup_ppg(self.target.players, self.ctx, self.n)
-        self.my_starters = starter_ids(self.me.players, self.ctx, self.n)
-        self.target_starters = starter_ids(self.target.players, self.ctx, self.n)
-        self.my_cut = self._cut_order(self.me.players, self.my_starters)
-        self.target_cut = self._cut_order(self.target.players, self.target_starters)
+        def weak(team_id):
+            return {r["Position"] for r in needs_table(snapshot.teams, snapshot.slots, team_id) if r["Status"] == "Weakness"}
 
-        strengths = needs_table(snapshot.teams, snapshot.slots, target_id)
-        self.weak_positions = {r["Position"] for r in strengths if r["Status"] == "Weakness"}
+        self.my_weak, self.their_weak = weak(my_id), weak(target_id)
 
-    def _cut_order(self, players, starters):
-        """Cheapest to cut first: bench before starters, then lowest value over replacement"""
-        return sorted(
-            players,
-            key=lambda p: (id(p) in starters, value_over_replacement(p, self.drv), p.base),
-        )
+    # ---- one side of a trade
+    def _side_impact(self, side: Side, weak_positions: set, outgoing, incoming) -> SideImpact:
+        out_ids = {id(p) for p in outgoing}
+        drops = [p for p in side.cut if id(p) not in out_ids][: max(0, len(incoming) - len(outgoing))]
+        drop_ids = {id(p) for p in drops}
 
-    def evaluate(self, send: List[PlayerValue], receive: List[PlayerValue]) -> TradeProposal:
-        """Score `send` (from you) for `receive` (from the target) from the target's perspective"""
-        send_ids = {id(p) for p in send}
-        recv_ids = {id(p) for p in receive}
+        # elite starters who stay: incoming players at their position are redundant
+        staying_elite = {
+            p.position for p in side.team.players
+            if id(p) in side.starters and id(p) in self.s_tier and id(p) not in out_ids
+        }
+        # 1QB / 1TE: a second QB/TE behind a top-tier QB1/TE1 contributes nothing
+        excluded = [p for p in incoming if p.position in self.single and p.position in staying_elite]
+        excluded_ids = {id(p) for p in excluded}
 
-        # whoever ends up with extra players must cut their cheapest bench players
-        target_drops = [p for p in self.target_cut if id(p) not in recv_ids][: max(0, len(send) - len(receive))]
-        my_drops = [p for p in self.my_cut if id(p) not in send_ids][: max(0, len(receive) - len(send))]
-        target_drop_ids = {id(p) for p in target_drops}
-        my_drop_ids = {id(p) for p in my_drops}
+        roster = [
+            p for p in side.team.players if id(p) not in out_ids and id(p) not in drop_ids
+        ] + [p for p in incoming if id(p) not in excluded_ids]
+        # excluded players are still rostered (bench), they just can't start
+        delta = lineup_ppg(roster, self.ctx, self.n) - side.before
+        perceived = delta
+        if "QB" in self.single:
+            qb_gain = max(0.0, single_slot_ppg(roster, "QB", self.drv, self.n) - side.qb_before)
+            perceived = delta - QB_GAIN_HAIRCUT * qb_gain
 
-        target_after = [
-            p for p in self.target.players if id(p) not in recv_ids and id(p) not in target_drop_ids
-        ] + list(send)
-        my_after = [
-            p for p in self.me.players if id(p) not in send_ids and id(p) not in my_drop_ids
-        ] + list(receive)
+        post_starters = starter_ids(roster, self.ctx, self.n)
+        incoming_starters = [p for p in incoming if id(p) in post_starters]
+        lost = [p for p in outgoing if id(p) in side.starters]
 
-        delta_lineup = lineup_ppg(target_after, self.ctx, self.n) - self.target_before
-        my_gain = lineup_ppg(my_after, self.ctx, self.n) - self.my_before
-
-        alpha = [p for p in receive if id(p) in self.s_tier]
-        tap = TAP_RATE * max(p.base for p in alpha) if alpha else 0.0
-        bcp = BCP_RATE * sum(value_over_replacement(p, self.drv) for p in target_drops)
-        if len(send) > len(receive):
-            tsp = TSP_RECEIVES_MORE
-        elif len(send) == len(receive) == 2:
-            tsp = TSP_TWO_FOR_TWO
-        else:
-            tsp = 0.0
-
-        post_starters = starter_ids(target_after, self.ctx, self.n)
-        incoming_starters = [p for p in send if id(p) in post_starters]
-        surrendered_starters = [p for p in receive if id(p) in self.target_starters]
-        ap = 0.0
-        if len(surrendered_starters) == 2 and len(send) == 2 and len(incoming_starters) == 1:
-            ap = AP_PENALTY
-
-        upgrades = self._upgrades(incoming_starters, recv_ids, post_starters)
-        weak = any(
+        redundant = [p for p in incoming if id(p) not in post_starters and p.position in staying_elite]
+        upgrades = self._upgrades(side, incoming_starters, out_ids, post_starters)
+        solves = any(
             displaced is None or displaced.base - self.drv.get(displaced.position, 0.0) <= WEAK_SLOT_MARGIN
             for _, displaced, _ in upgrades
-        ) or any(p.position in self.weak_positions for p in incoming_starters)
+        ) or any(p.position in weak_positions for p in incoming_starters)
 
-        mai = delta_lineup - tap - bcp - tsp - ap
-        return TradeProposal(
-            target_id=self.target.team_id,
-            target_name=self.target.name,
-            send=list(send),
-            receive=list(receive),
-            mai=mai,
-            delta_lineup=delta_lineup,
-            tap=tap, bcp=bcp, tsp=tsp, ap=ap,
-            my_gain=my_gain,
-            tier=self._assign_tier(mai, send, receive, alpha, weak),
-            target_drops=target_drops,
-            my_drops=my_drops,
+        return SideImpact(
+            delta=delta,
+            perceived=perceived,
             upgrades=upgrades,
-            alpha_assets=alpha,
-            solves_deficiency=weak,
-            notes=_notes(send, receive),
+            drops=drops,
+            lost_starters=lost,
+            redundant=redundant,
+            solves_hole=solves,
+            # never give up starting depth for a bench piece at a position where you're already elite
+            blocked=bool(redundant) and bool(lost),
         )
 
-    def _upgrades(self, incoming_starters, recv_ids, post_starters):
-        """Which of the target's starters each incoming starter displaces (None = waiver-filled slot)"""
-        displaced_pool = [
-            p for p in self.target.players
-            if id(p) in self.target_starters and id(p) not in recv_ids and id(p) not in post_starters
-        ]
-        displaced_pool.sort(key=lambda p: p.base)
+    def _upgrades(self, side: Side, incoming_starters, out_ids, post_starters):
+        """Which of the side's starters each incoming starter displaces (None = waiver-filled slot)"""
+        pool = sorted(
+            (p for p in side.team.players
+             if id(p) in side.starters and id(p) not in out_ids and id(p) not in post_starters),
+            key=lambda p: p.base,
+        )
         upgrades = []
         for p in sorted(incoming_starters, key=lambda p: p.base, reverse=True):
-            match = next((d for d in displaced_pool if d.position == p.position), None) or (
-                displaced_pool[0] if displaced_pool else None
-            )
+            match = next((d for d in pool if d.position == p.position), None) or (pool[0] if pool else None)
             if match is not None:
-                displaced_pool.remove(match)
+                pool.remove(match)
                 gain = max(0.0, p.base - match.base)
             else:
                 gain = max(0.0, p.base - self.drv.get(p.position, 0.0))
             upgrades.append((p, match, gain))
         return upgrades
 
-    def _assign_tier(self, mai, send, receive, alpha, solves_deficiency) -> Optional[str]:
-        tier = tier_for(mai)
-        if tier == "Win-Win":
-            simple = (len(send), len(receive)) in ((1, 1), (2, 2))
-            unearned_alpha = bool(alpha) and not any(id(p) in self.s_tier for p in send)
-            if not (simple and solves_deficiency and not unearned_alpha):
-                tier = "Worth a Shot"
-        return tier
+    def evaluate(self, send: List[PlayerValue], receive: List[PlayerValue]) -> TradeProposal:
+        """Score `send` (from you) for `receive` (from the target)"""
+        recv_ids = {id(p) for p in receive}
+        mine = self._side_impact(self.mine, self.my_weak, send, receive)
+        theirs = self._side_impact(self.theirs, self.their_weak, receive, send)
+
+        alpha = [p for p in receive if id(p) in self.s_tier]
+        tap = TAP_RATE * sum(p.base for p in alpha)
+        if len(send) > len(receive):
+            tap *= TAP_PACKAGE_MULT      # a depth package for a star is the classic rejection
+        bcp = BCP_RATE * sum(value_over_replacement(p, self.drv) for p in theirs.drops) if len(send) >= 2 else 0.0
+        tsp = structure_penalty(len(send), len(receive))
+
+        # Positional Loss Tax: the target surrenders a starter it can't replace from what comes back
+        plt = 0.0
+        incoming_starter_positions = {p.position for p, _, _ in theirs.upgrades}
+        for p in receive:
+            if id(p) not in self.theirs.starters or p.position in incoming_starter_positions:
+                continue
+            over = max(0.0, p.base - self.drv.get(p.position, 0.0))
+            if p.position in self.single and p.base >= max(
+                (q.base for q in self.theirs.team.players if id(q) in self.theirs.starters and q.position == p.position),
+                default=0.0,
+            ):
+                plt += PLT_QB_TE_RATE * over      # starting QB1 / TE1 in a 1QB / 1TE format
+            elif id(p) in self.s_tier:
+                plt += VOID_RATE * over           # a premier starter leaves a real hole
+
+        surrendered_starters = [p for p in receive if id(p) in self.theirs.starters]
+        incoming_starters = [p for p, _, _ in theirs.upgrades]
+        ap = AP_PENALTY if (
+            len(surrendered_starters) >= 2 and len(send) >= 2 and len(incoming_starters) < len(surrendered_starters)
+        ) else 0.0
+
+        lat = LATERAL_TAX if sorted(p.position for p in send) == sorted(p.position for p in receive) else 0.0
+
+        # Talent floor: don't hand over a clearly better player for a lesser one, unless a real
+        # hole at a different position is being filled
+        best_out, best_in = max(p.base for p in receive), max(p.base for p in send)
+        tfl = 0.0
+        if best_in < TALENT_FLOOR_RATIO * best_out:
+            top_out = max(receive, key=lambda p: p.base)
+            fills_other_hole = theirs.solves_hole and any(p.position != top_out.position for p in send)
+            tfl = (TALENT_GAP_HOLE_RATE if fills_other_hole else TALENT_GAP_RATE) * (best_out - best_in)
+
+        t = TradeProposal(
+            target_id=self.theirs.team.team_id,
+            target_name=self.theirs.team.name,
+            send=list(send),
+            receive=list(receive),
+            mine=mine,
+            theirs=theirs,
+            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl,
+            alpha_assets=alpha,
+            notes=_notes(send, receive),
+        )
+        t.tier = self._assign_tier(t)
+        return t
+
+    def _assign_tier(self, t: TradeProposal) -> Optional[str]:
+        if t.blocked or t.theirs.delta < 0 or t.mine.delta <= 0:
+            return None
+        mai, mine = t.mai, t.mine.delta
+        simple = (len(t.send), len(t.receive)) in ((1, 1), (2, 2))
+        mutual_holes = t.mine.solves_hole and t.theirs.solves_hole
+        no_redundancy = not t.mine.redundant and not t.theirs.redundant
+        if mai >= WIN_WIN[1] and mine >= WIN_WIN[3] and simple and mutual_holes and no_redundancy:
+            return WIN_WIN[0]
+        # a trade that clears the Win-Win numbers but breaks its structure rules is still worth a shot
+        if mai >= WORTH_A_SHOT[1] and mine >= WORTH_A_SHOT[3]:
+            return WORTH_A_SHOT[0]
+        if LONG_SHOT[1] <= mai < LONG_SHOT[2] and mine >= LONG_SHOT[3]:
+            return LONG_SHOT[0]
+        return None
 
 
 def _notes(send, receive) -> List[str]:
@@ -457,13 +593,12 @@ def generate_trades(
     snapshot: LeagueSnapshot,
     my_id: int,
     target_id: int,
-    min_my_gain: float = MIN_MY_GAIN,
+    strict: bool = False,
     per_tier: int = PER_TIER,
 ) -> Dict[str, List[TradeProposal]]:
-    """1 to `per_tier` proposals in each acceptance tier for one target team.
+    """Proposals in each acceptance tier for one target team, best mutual utility first.
 
-    A proposal must give the target a non-negative lineup change and give you at least
-    `min_my_gain`; within a tier the ones that help you most come first.
+    strict=True keeps only trades the target clearly clears (MAI >= +1.5).
     """
     result: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
     if my_id not in snapshot.teams or target_id not in snapshot.teams or my_id == target_id:
@@ -474,26 +609,30 @@ def generate_trades(
         return result
 
     def pool(players):
-        return sorted((p for p in players if p.base > 0), key=lambda p: p.base, reverse=True)[:POOL_SIZE]
+        eligible = (
+            p for p in players
+            if p.base > 0 and p.position not in NON_TRADE_POSITIONS and p.injury != "INJURY_RESERVE"
+        )
+        return sorted(eligible, key=lambda p: p.base, reverse=True)[:POOL_SIZE]
 
-    my_pool, their_pool = pool(tc.me.players), pool(tc.target.players)
+    my_pool, their_pool = pool(tc.mine.team.players), pool(tc.theirs.team.players)
     candidates: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
     for send_n, recv_n in [(1, 1), (2, 1), (1, 2), (2, 2)]:
         for send in combinations(my_pool, send_n):
             for receive in combinations(their_pool, recv_n):
                 t = tc.evaluate(list(send), list(receive))
-                if t.tier is None or t.delta_lineup < 0 or t.my_gain < min_my_gain:
+                if t.tier is None or (strict and t.mai < STRICT_MIN_MAI):
                     continue
                 candidates[t.tier].append(t)
 
     for tier, found in candidates.items():
-        found.sort(key=lambda t: (-t.my_gain, -t.mai))
+        found.sort(key=lambda t: (-t.nmu, -t.mai))
         used_send, used_recv = set(), set()
         for t in found:
             s_ids, r_ids = {id(p) for p in t.send}, {id(p) for p in t.receive}
             if s_ids & used_send or r_ids & used_recv:
                 continue
-            t.why = explain(t)
+            t.you_why, t.them_why = explain(t)
             result[tier].append(t)
             used_send |= s_ids
             used_recv |= r_ids
@@ -503,10 +642,10 @@ def generate_trades(
 
 
 def evaluate_custom(snapshot: LeagueSnapshot, my_id: int, target_id: int, send, receive) -> TradeProposal:
-    """Score a specific trade you typed in (same MAI as the generated ones)"""
+    """Score a specific trade you typed in (same math as the generated ones)"""
     tc = TradeContext(snapshot, my_id, target_id)
     t = tc.evaluate(list(send), list(receive))
-    t.why = explain(t)
+    t.you_why, t.them_why = explain(t)
     return t
 
 
@@ -516,67 +655,66 @@ def _names(players) -> str:
     return " + ".join(p.name for p in players)
 
 
-def _structure(t: TradeProposal) -> str:
-    return f"{len(t.send)}-for-{len(t.receive)}"
+def positions_fixed(side: SideImpact) -> List[str]:
+    return sorted({p.position for p, _, _ in side.upgrades})
 
 
-def _upgrade_text(t: TradeProposal) -> str:
+def displaced_players(side: SideImpact) -> List[PlayerValue]:
+    return [d for _, d, _ in side.upgrades if d is not None]
+
+
+def _upgrade_text(side: SideImpact) -> str:
     parts = []
-    for p, displaced, gain in t.upgrades:
+    for p, displaced, gain in side.upgrades:
         over = (
             f"over {displaced.name} ({displaced.base:.1f})"
-            if displaced else "in a slot they'd otherwise fill from waivers"
+            if displaced else "in a slot that would otherwise be filled from waivers"
         )
-        parts.append(f"{p.name} ({p.base:.1f} PPG) would start at {p.position} {over}, +{gain:.1f} PPG")
+        parts.append(f"{p.name} ({p.base:.1f} PPG) starts at {p.position} {over}, +{gain:.1f} PPG")
     return "; ".join(parts)
 
 
-def _frictions(t: TradeProposal) -> List[str]:
-    out = []
-    if t.tsp:
-        out.append(f"{_structure(t)} structure (-{t.tsp:.1f})")
-    if t.bcp:
-        out.append(f"they'd have to cut {_names(t.target_drops)} (-{t.bcp:.1f})")
-    if t.tap:
-        out.append(f"they'd be giving up S-tier {_names(t.alpha_assets)} (-{t.tap:.1f} Alpha tax)")
-    if t.ap:
-        out.append(f"two starters out for one starter plus a bench piece (-{t.ap:.1f})")
-    return out
+PENALTY_LABELS = {
+    "TAP": "Alpha tax", "BCP": "bench clutter", "TSP": "trade structure",
+    "PLT": "positional loss", "AP": "asymmetry", "LAT": "lateral swap", "TFL": "talent gap",
+}
 
 
-def explain(t: TradeProposal) -> str:
-    """One paragraph in the voice the tier calls for"""
-    upside = _upgrade_text(t)
-    friction = _frictions(t)
-    if t.tier == "Win-Win":
-        return (
-            f"Fills a weak starting slot for {t.target_name}: {upside or 'improves their lineup'}. "
-            f"Clean {_structure(t)} with no Alpha asset requested, so there's little friction."
-        )
-    if t.tier == "Worth a Shot":
-        hesitate = "; ".join(friction) if friction else (
-            "the gain is real but modest, near the point where owner bias decides it"
-        )
-        return f"Upside for them: {upside or f'+{t.delta_lineup:.1f} PPG in their lineup'}. Hesitation: {hesitate}."
-    reasons = "; ".join(friction) if friction else "the lineup gain for them is marginal"
-    pitch = []
-    for p in t.alpha_assets:
-        if p.injured:
-            pitch.append(f"{p.name} is {p.injury.replace('_', ' ').title()}, which is the opening to ask for him")
-        elif p.weekly and p.weekly.count(0.0):
-            pitch.append(f"{p.name} is on a bye inside the window, so his short-term value to them is lower")
-    if t.upgrades:
-        p, _, gain = t.upgrades[0]
-        pitch.append(
-            f"lead with the {p.position} upgrade: +{gain:.1f} PPG at the slot, "
-            f"+{t.delta_lineup:.1f} PPG for their lineup"
-        )
-    if t.target_drops:
-        pitch.append("offer to take the roster clutter off their hands")
-    return (
-        f"They'll likely resist: {reasons}. "
-        f"How to pitch it: {'; '.join(pitch) or 'frame it around the lineup upgrade for them'}."
+def explain(t: TradeProposal) -> Tuple[str, str]:
+    """(why it works for you, why it works for them)"""
+    you = []
+    if t.mine.upgrades:
+        you.append(_upgrade_text(t.mine))
+    if t.mine.lost_starters:
+        you.append(f"you give up {_names(t.mine.lost_starters)} from your lineup and still net {t.mine.delta:+.1f} PPG")
+    if t.mine.drops:
+        you.append(f"you'd cut {_names(t.mine.drops)} to make room")
+    dup = [pos for pos in ("QB", "TE") if pos in {p.position for p in t.mine.redundant}]
+    you.append(
+        "avoids QB/TE duplication" if not t.mine.redundant
+        else f"note: {_names(t.mine.redundant)} is redundant behind your top {'/'.join(dup) or 'starter'}"
     )
+
+    them = []
+    if t.theirs.upgrades:
+        them.append(_upgrade_text(t.theirs))
+    else:
+        them.append(f"their lineup changes by {t.theirs.delta:+.1f} PPG")
+    if t.penalties:
+        friction = ", ".join(f"{PENALTY_LABELS[name]} -{value:.1f}" for name, value in t.penalties)
+        them.append(f"friction they'll feel: {friction}")
+    else:
+        them.append("no friction penalties apply")
+    if t.alpha_assets:
+        pitch = []
+        for p in t.alpha_assets:
+            if p.injured:
+                pitch.append(f"{p.name} is {p.injury.replace('_', ' ').title()}, which is the opening")
+            elif p.weekly and p.weekly.count(0.0):
+                pitch.append(f"{p.name} is on a bye in the window, so his short-term value to them is lower")
+        if pitch:
+            them.append("pitch: " + "; ".join(pitch))
+    return "; ".join(you) + ".", "; ".join(them) + "."
 
 
 # ------------------------------------------------------------ ESPN integration
@@ -603,27 +741,29 @@ def _fetch_ratings(league, weeks: List[int]) -> Dict[int, Dict[str, Dict[str, in
 
 
 def fetch_drv(league, week: int) -> Tuple[Dict[str, float], bool]:
-    """Top waiver PPG at each position from the league's actual free agents.
+    """Waiver PPG at each position from the league's actual free agents.
 
-    Returns (drv, live). Positions whose lookup fails fall back to FALLBACK_DRV, and live is
-    False unless every position came from real free agents.
+    The average of the best DRV_TOP_N healthy free agents, so one hot pickup or odd projection
+    can't move every gain and penalty. Returns (drv, live). Positions whose lookup fails fall
+    back to FALLBACK_DRV, and live is False unless every position came from real free agents.
     """
     drv = dict(FALLBACK_DRV)
     live = True
     for pos in FALLBACK_DRV:
         try:
-            best = 0.0
+            values = []
             for fa in league.free_agents(week=week, size=25, position=pos):
                 status = (getattr(fa, "injuryStatus", "") or "ACTIVE").upper()
                 if status in ("OUT", "INJURY_RESERVE", "SUSPENSION"):
                     continue
-                best = max(best, base_points(
+                values.append(base_points(
                     getattr(fa, "avg_points", 0),
                     getattr(fa, "projected_avg_points", 0),
                     getattr(fa, "total_points", 0),
                 ))
-            if best > 0:
-                drv[pos] = best
+            top = sorted((v for v in values if v > 0), reverse=True)[:DRV_TOP_N]
+            if top:
+                drv[pos] = sum(top) / len(top)
             else:
                 live = False
         except Exception as e:

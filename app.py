@@ -8,7 +8,8 @@ import plotly.graph_objects as go
 from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
-    TIERS, WEEKS_AHEAD, MIN_MY_GAIN, build_league_snapshot, evaluate_custom, generate_trades, needs_table,
+    TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
+    PENALTY_LABELS, positions_fixed,
 )
 from config import LEAGUES
 import logging
@@ -58,10 +59,10 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
 
 
 @st.cache_data(ttl=300, show_spinner="Scanning rosters, free agents and schedules...")
-def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, min_my_gain):
+def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict):
     """Trade proposals for one target team (the snapshot underneath is cached too)"""
     snapshot = cached_snapshot(_lm, league_name, weeks_ahead)
-    return generate_trades(snapshot, my_id, target_id, min_my_gain=min_my_gain)
+    return generate_trades(snapshot, my_id, target_id, strict=strict)
 
 
 TIER_STYLE = {
@@ -75,23 +76,27 @@ def names(players):
     return " + ".join(f"**{p.name}** ({p.position}, {p.base:.1f} PPG)" for p in players)
 
 
-def render_mai_breakdown(t):
-    st.caption(
-        f"MAI = ΔLineup {t.delta_lineup:+.1f} − TAP {t.tap:.1f} − BCP {t.bcp:.1f} "
-        f"− TSP {t.tsp:.1f} − AP {t.ap:.1f} · your lineup {t.my_gain:+.1f} PPG"
-    )
-    for note in t.notes:
-        st.caption(f"⚠️ {note}")
-    if t.my_drops:
-        st.caption("You would cut: " + ", ".join(p.name for p in t.my_drops))
-
-
-def render_proposal(t, why_label):
+def render_proposal(t, why_label=None):
     with st.container(border=True):
         st.markdown(f"**Proposed Trade:** You send {names(t.send)} ↔ You receive {names(t.receive)}")
-        st.markdown(f"**Target MAI Score:** {t.mai:+.1f} PPG")
-        st.markdown(f"**{why_label}:** {t.why}")
-        render_mai_breakdown(t)
+
+        fixed = ", ".join(positions_fixed(t.mine)) or "none"
+        displaced = ", ".join(f"{p.name} ({p.base:.1f})" for p in displaced_players(t.mine)) or "none"
+        friction = ", ".join(f"{PENALTY_LABELS[n]} −{v:.1f}" for n, v in t.penalties) or "none"
+        st.markdown(
+            "**Impact Breakdown**\n"
+            f"- **Your Team:** net starting gain **{t.my_gain:+.1f} PPG** · positions fixed: {fixed} · displaced: {displaced}\n"
+            f"- **Target Team:** MAI **{t.mai:+.1f} PPG** · net lineup Δ {t.delta_lineup:+.1f} PPG · "
+            f"friction penalties: {friction}\n"
+            f"- **Net Mutual Utility:** {t.nmu:+.1f} PPG"
+        )
+        st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {t.you_why}\n- **Why it works for them:** {t.them_why}")
+        for note in t.notes:
+            st.caption(f"⚠️ {note}")
+        if t.mine.drops:
+            st.caption("You would cut: " + ", ".join(p.name for p in t.mine.drops))
+        if t.theirs.drops:
+            st.caption("They would cut: " + ", ".join(p.name for p in t.theirs.drops))
 
 
 def render_tiers(trades):
@@ -101,7 +106,7 @@ def render_tiers(trades):
         if not trades[tier]:
             st.caption("No proposal in this tier.")
         for t in trades[tier]:
-            render_proposal(t, why_label)
+            render_proposal(t)
 
 
 def record_class(wins, losses):
@@ -354,16 +359,20 @@ def main():
     elif page == "🔁 Trade Finder":
         st.header("🔁 Trade Finder")
         st.caption(
-            "Every trade is scored from the other manager's side with the Manager Acceptance Index: "
-            "MAI = ΔLineup − TAP (Alpha tax) − BCP (bench clutter) − TSP (trade structure) − AP (asymmetry). "
-            "Higher means they're more likely to say yes."
+            "A trade is only shown when it works for both managers. Your side: net starting-lineup gain. "
+            "Their side: Manager Acceptance Index, MAI = ΔLineup − TAP (Alpha tax) − BCP (bench clutter) "
+            "− TSP (trade structure) − PLT (lost starter) − AP (asymmetry) − lateral-swap tax. Net Mutual Utility = your gain + their MAI."
         )
 
         c1, c2 = st.columns(2)
         with c1:
             weeks_ahead = st.slider("Weeks to look ahead", 1, 6, WEEKS_AHEAD)
         with c2:
-            min_my_gain = st.slider("Minimum gain for you (PPG)", 0.0, 5.0, MIN_MY_GAIN, 0.5)
+            strict = st.toggle(
+                "Strict acceptance (their MAI ≥ +1.5)",
+                value=False,
+                help="Hides trades the other manager only marginally clears. The Long Shot tier is empty in this mode.",
+            )
 
         snapshot = cached_snapshot(league_manager, league_name, weeks_ahead)
         if team_id not in snapshot.teams:
@@ -385,7 +394,7 @@ def main():
             target_choice = st.selectbox("Target team", ["Scan every team"] + list(others))
             if target_choice == "Scan every team":
                 for name, tid in others.items():
-                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, min_my_gain)
+                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict)
                     total = sum(len(v) for v in trades.values())
                     best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "·")
                     label = f"{best} {name} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}"
@@ -393,7 +402,7 @@ def main():
                         render_tiers(trades)
             else:
                 render_tiers(cached_trades(
-                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], min_my_gain
+                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict
                 ))
 
             st.subheader("Score your own trade")
@@ -411,10 +420,11 @@ def main():
                     [p for p in mine if p.name in send_names],
                     [p for p in theirs if p.name in recv_names],
                 )
+                if t.blocked:
+                    st.warning("Blocked: this gives up starting depth for a redundant bench piece where you're already elite.")
                 icon = TIER_STYLE[t.tier][0] if t.tier else "⛔"
-                st.markdown(f"{icon} **{t.tier or 'Below the Long Shot floor (MAI < −1.5)'}** · Target MAI {t.mai:+.1f} PPG")
-                st.markdown(t.why)
-                render_mai_breakdown(t)
+                st.markdown(f"{icon} **{t.tier or 'Does not clear any tier'}**")
+                render_proposal(t)
 
     # Page: Team Analysis
     elif page == "🤝 Team Analysis":
