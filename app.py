@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    PENALTY_LABELS, positions_fixed,
+    PENALTY_LABELS, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -76,6 +76,20 @@ def names(players):
     return " + ".join(f"**{p.name}** ({p.position}, {p.base:.1f} PPG)" for p in players)
 
 
+def lineup_table(title, impact):
+    """Slot-by-slot lineup before and after a trade, so the model's math can be checked by eye"""
+    rows = []
+    for (slot, before_who, before), (_, after_who, after) in zip(impact.lineup_before, impact.lineup_after):
+        rows.append({
+            "Slot": slot,
+            "Before": f"{before_who} ({before:.1f})",
+            "After": f"{after_who} ({after:.1f})",
+            "Change": f"{after - before:+.1f}",
+        })
+    st.markdown(f"**{title}** · net {impact.delta:+.1f} PPG")
+    st.dataframe(rows, width="stretch", hide_index=True)
+
+
 def render_proposal(t, why_label=None):
     with st.container(border=True):
         st.markdown(f"**Proposed Trade:** You send {names(t.send)} ↔ You receive {names(t.receive)}")
@@ -94,6 +108,9 @@ def render_proposal(t, why_label=None):
             f"- **Net Mutual Utility:** {t.nmu:+.1f} PPG"
         )
         st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {t.you_why}\n- **Why it works for them:** {t.them_why}")
+        with st.expander("Lineup before → after"):
+            lineup_table("You", t.mine)
+            lineup_table(t.target_name, t.theirs)
         for note in t.notes:
             st.caption(f"⚠️ {note}")
         if t.mine.drops:
@@ -427,6 +444,8 @@ def main():
                     st.warning("Blocked: this gives up starting depth for a redundant bench piece where you're already elite.")
                 icon = TIER_STYLE[t.tier][0] if t.tier else "⛔"
                 st.markdown(f"{icon} **{t.tier or 'Does not clear any tier'}**")
+                if not t.tier:
+                    st.info(why_no_tier(t))
                 render_proposal(t)
 
     # Page: Team Analysis

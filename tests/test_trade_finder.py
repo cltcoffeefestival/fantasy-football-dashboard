@@ -6,7 +6,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trade_finder import (  # noqa: E402
     FALLBACK_DRV, TAP_RATE, TSP_TARGET_RECEIVES_FEWER, TSP_TARGET_RECEIVES_MORE, TSP_TWO_FOR_TWO,
-    LeagueSnapshot, PlayerValue, TeamSnapshot, TradeContext, build_slots, generate_trades,
+    LeagueSnapshot, PlayerValue, TeamSnapshot, TradeContext, TradeProposal, build_slots, generate_trades,
     lineup_ppg, single_slot_positions, slot_context, structure_penalty, value_over_replacement,
 )
 
@@ -342,3 +342,50 @@ def test_a_bench_player_above_waiver_level_is_still_a_throw_in_if_he_would_not_s
     assert t.tsp == TSP_TARGET_RECEIVES_FEWER
     assert [p.name for p in t.real_in_players] == ["mTE"]
     assert t.tier is None or t.mai < 0.5      # no longer a Worth a Shot
+
+
+# ---- explaining why a custom trade misses every tier
+
+from trade_finder import why_no_tier  # noqa: E402
+
+
+def _proposal(mine_delta, theirs_delta, blocked=False, **penalties):
+    from trade_finder import SideImpact
+    return TradeProposal(
+        target_id=2, target_name="Them", send=[], receive=[],
+        mine=SideImpact(delta=mine_delta, perceived=mine_delta, blocked=blocked),
+        theirs=SideImpact(delta=theirs_delta, perceived=theirs_delta),
+        tap=penalties.get("tap", 0.0), bcp=0.0, tsp=penalties.get("tsp", 0.0), plt=0.0,
+    )
+
+
+def test_why_no_tier_names_the_bar_that_was_missed():
+    # Bowers-for-Watson shape: easy for them (MAI +2.1) but only +0.4 for you
+    msg = why_no_tier(_proposal(0.4, 2.1))
+    assert "+2.1" in msg and "+0.4" in msg and "1.0" in msg and "Worth a Shot" in msg
+    assert "hurts" in why_no_tier(_proposal(-1.0, 3.0)) or "doesn't improve your lineup" in why_no_tier(_proposal(-1.0, 3.0))
+    assert "gets worse" in why_no_tier(_proposal(2.0, -0.5))
+    assert "floor" in why_no_tier(_proposal(4.0, 1.0, tsp=3.5))          # MAI -2.5
+    assert "Long Shot" in why_no_tier(_proposal(2.0, 0.3))               # MAI +0.3, needs 3.0+
+    assert "Blocked" in why_no_tier(_proposal(2.0, 2.0, blocked=True))
+
+
+# ---- lineup before/after (so the math can be checked by eye)
+
+from trade_finder import lineup_rows  # noqa: E402
+
+
+def test_backup_te_steps_in_when_the_starter_is_traded_and_the_lineup_table_shows_it():
+    me = core("m", [P("Loveland", "TE", 11.0), P("Addison", "WR", 10.4)], te=16.2)
+    target = core("t", [P("Watson", "WR", 16.8)], te=11.8)
+    fillers = [core(f"f{i}", te=13) for i in range(3)]
+    snap = snapshot(me, target, fillers)
+    tc = TradeContext(snap, 1, 2)
+    t = tc.evaluate([p for p in me if p.name == "mTE"], [p for p in target if p.name == "Watson"])
+    tc.attach_lineups(t)
+    before = {slot_who: pts for slot, slot_who, pts in t.mine.lineup_before if slot == "TE"}
+    after = {slot_who: pts for slot, slot_who, pts in t.mine.lineup_after if slot == "TE"}
+    assert before == {"mTE": 16.2}
+    assert after == {"Loveland": 11.0}       # Loveland plays TE, not a waiver pickup
+    # so losing Bowers costs 16.2 - 11.0 at TE, not 16.2 - the waiver TE
+    assert abs((11.0 - 16.2) - (-5.2)) < 1e-9

@@ -141,6 +141,9 @@ class SideImpact:
     drops: List[PlayerValue] = field(default_factory=list)       # bench players cut to make room
     lost_starters: List[PlayerValue] = field(default_factory=list)
     redundant: List[PlayerValue] = field(default_factory=list)   # incoming players that add nothing
+    after_roster: List[PlayerValue] = field(default_factory=list)   # lineup-eligible roster after the trade
+    lineup_before: List[Tuple[str, str, float]] = field(default_factory=list)
+    lineup_after: List[Tuple[str, str, float]] = field(default_factory=list)
     slot_notes: Dict[int, str] = field(default_factory=dict)     # id(incoming) -> why a slot counts as waiver-filled
     solves_hole: bool = False                                    # fills a weak slot / weak position
     blocked: bool = False                                        # gives up starters for a redundant bench piece
@@ -298,7 +301,7 @@ def single_slot_positions(slots) -> set:
 
 
 def _solve_week(players: List[PlayerValue], ctx, week: int):
-    """Best lineup for one week. Returns (points, players who start).
+    """Best lineup for one week. Returns (points, players who start, per-slot assignments).
 
     A slot goes to the best available rostered player, unless a waiver pickup would score more
     (bye, injury, or nobody eligible), in which case it is filled at the waiver value.
@@ -307,6 +310,7 @@ def _solve_week(players: List[PlayerValue], ctx, week: int):
     used = set()
     total = 0.0
     starters = []
+    assigned = []   # per slot: (player or None for a waiver pickup, points)
     for eligible, waiver in ctx:
         for idx, p in enumerate(ranked):
             if idx not in used and p.position in eligible:
@@ -314,12 +318,32 @@ def _solve_week(players: List[PlayerValue], ctx, week: int):
                     used.add(idx)
                     total += p.weekly[week]
                     starters.append(p)
+                    assigned.append((p, p.weekly[week]))
                 else:
                     total += waiver
+                    assigned.append((None, waiver))
                 break
         else:
             total += waiver
-    return total, starters
+            assigned.append((None, waiver))
+    return total, starters, assigned
+
+
+def lineup_rows(players: List[PlayerValue], slots, ctx, n_weeks: int) -> List[Tuple[str, str, float]]:
+    """(slot, who usually fills it, PPG) for the optimal lineup, averaged over the window"""
+    per_slot: List[List[Tuple[Optional[PlayerValue], float]]] = [[] for _ in ctx]
+    for w in range(n_weeks):
+        for i, entry in enumerate(_solve_week(players, ctx, w)[2]):
+            per_slot[i].append(entry)
+    rows = []
+    for (label, _), entries in zip(slots, per_slot):
+        names: Dict[str, int] = {}
+        for p, _ in entries:
+            key = p.name if p else "Waiver pickup"
+            names[key] = names.get(key, 0) + 1
+        who = max(names, key=names.get)
+        rows.append((label, who, sum(pts for _, pts in entries) / n_weeks))
+    return rows
 
 
 def lineup_ppg(players: List[PlayerValue], ctx, n_weeks: int) -> float:
@@ -451,7 +475,7 @@ class TradeContext:
         self.my_weak, self.their_weak = weak(my_id), weak(target_id)
 
     # ---- one side of a trade
-    def _side_impact(self, side: Side, weak_positions: set, outgoing, incoming) -> SideImpact:
+    def _side_impact(self, side: Side, weak_positions: set, outgoing, incoming, whose: str = "their") -> SideImpact:
         out_ids = {id(p) for p in outgoing}
         drops = [p for p in side.cut if id(p) not in out_ids][: max(0, len(incoming) - len(outgoing))]
         drop_ids = {id(p) for p in drops}
@@ -506,11 +530,12 @@ class TradeContext:
                 )
                 waiver = self.drv.get(p.position, 0.0)
                 slot_notes[id(p)] = (
-                    f"the model fills that slot from waivers ({waiver:.1f} PPG); their best rostered "
+                    f"the model fills that slot from waivers ({waiver:.1f} PPG); {whose} best rostered "
                     f"{p.position} is {best.name} ({best.base:.1f})" if best is not None
-                    else f"they have no rostered {p.position}, so the model fills it from waivers ({waiver:.1f} PPG)"
+                    else f"{whose} roster has no {p.position}, so the model fills it from waivers ({waiver:.1f} PPG)"
                 )
         return SideImpact(
+            after_roster=roster,
             slot_notes=slot_notes,
             delta=delta,
             perceived=perceived,
@@ -544,7 +569,7 @@ class TradeContext:
     def evaluate(self, send: List[PlayerValue], receive: List[PlayerValue]) -> TradeProposal:
         """Score `send` (from you) for `receive` (from the target)"""
         recv_ids = {id(p) for p in receive}
-        mine = self._side_impact(self.mine, self.my_weak, send, receive)
+        mine = self._side_impact(self.mine, self.my_weak, send, receive, whose="your")
         theirs = self._side_impact(self.theirs, self.their_weak, receive, send)
 
         alpha = [p for p in receive if id(p) in self.s_tier]
@@ -610,6 +635,13 @@ class TradeContext:
         t.tier = self._assign_tier(t)
         return t
 
+    def attach_lineups(self, t: TradeProposal) -> None:
+        """Fill in the slot-by-slot lineups before and after (only for trades that get displayed)"""
+        slots = self.snapshot.slots
+        for side, impact in ((self.mine, t.mine), (self.theirs, t.theirs)):
+            impact.lineup_before = lineup_rows(side.team.players, slots, self.ctx, self.n)
+            impact.lineup_after = lineup_rows(impact.after_roster, slots, self.ctx, self.n)
+
     def _assign_tier(self, t: TradeProposal) -> Optional[str]:
         if t.blocked or t.theirs.delta < 0 or t.mine.delta <= 0:
             return None
@@ -625,6 +657,35 @@ class TradeContext:
         if LONG_SHOT[1] <= mai < LONG_SHOT[2] and mine >= LONG_SHOT[3]:
             return LONG_SHOT[0]
         return None
+
+
+def why_no_tier(t: TradeProposal) -> str:
+    """Which bar a trade misses, in plain words (empty when it does clear a tier)"""
+    if t.tier is not None:
+        return ""
+    if t.blocked:
+        return "Blocked: it gives up a starter for a bench piece at a position where you're already elite."
+    if t.theirs.delta < 0:
+        return f"Their lineup gets worse ({t.theirs.delta:+.1f} PPG), so they have no reason to accept."
+    if t.mine.delta <= 0:
+        return f"It doesn't improve your lineup ({t.mine.delta:+.1f} PPG)."
+    mai, mine = t.mai, t.mine.delta
+    if mai < LONG_SHOT[1]:
+        return f"Their acceptance score is {mai:+.1f}, below the {LONG_SHOT[1]:+.1f} floor for even a Long Shot."
+    if mai >= WIN_WIN[1]:
+        return (
+            f"It's easy for them to accept (MAI {mai:+.1f}), but your gain of {mine:+.1f} PPG is below "
+            f"the {WORTH_A_SHOT[3]:.1f} needed for Worth a Shot ({WIN_WIN[3]:.1f} for Win-Win)."
+        )
+    if mai >= WORTH_A_SHOT[1]:
+        return (
+            f"Their MAI is fine ({mai:+.1f}), but your gain of {mine:+.1f} PPG is below the "
+            f"{WORTH_A_SHOT[3]:.1f} needed for Worth a Shot."
+        )
+    return (
+        f"Their MAI is only {mai:+.1f}, which makes it a Long Shot at best, and a Long Shot needs a "
+        f"gain of {LONG_SHOT[3]:.1f}+ PPG for you (you'd get {mine:+.1f})."
+    )
 
 
 def _notes(send, receive) -> List[str]:
@@ -683,6 +744,7 @@ def generate_trades(
             if s_ids & used_send or r_ids & used_recv:
                 continue
             t.you_why, t.them_why = explain(t)
+            tc.attach_lineups(t)
             result[tier].append(t)
             used_send |= s_ids
             used_recv |= r_ids
@@ -696,6 +758,7 @@ def evaluate_custom(snapshot: LeagueSnapshot, my_id: int, target_id: int, send, 
     tc = TradeContext(snapshot, my_id, target_id)
     t = tc.evaluate(list(send), list(receive))
     t.you_why, t.them_why = explain(t)
+    tc.attach_lineups(t)
     return t
 
 
