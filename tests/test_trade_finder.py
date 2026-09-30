@@ -421,6 +421,7 @@ def test_empty_result_explains_itself_and_offers_the_closest_misses():
     assert sum(result.funnel[k] for k in result.funnel if k != "checked") == result.funnel["checked"]
     for t in result.near_misses:
         assert t.tier is None and not t.blocked and t.theirs.delta >= 0 and t.mine.delta > 0
+        assert t.mai >= 0.5 and t.lat == 0 and t.my_effective_gain >= 0.2      # acceptable, not lateral, a real edge
         assert t.you_why and why_no_tier(t)
 
 
@@ -465,3 +466,14 @@ def test_selling_an_elite_spare_qb_for_a_lesser_wr_is_not_recommended():
 def test_an_even_talent_swap_has_no_sell_low_penalty():
     snap = pair([P("a", "WR", 13)], [P("x", "WR", 12)])
     assert evaluate(snap, ["a"], ["x"]).sell_low == 0.0
+
+
+def test_a_lateral_qb_swap_is_never_a_near_miss():
+    # Shough for Lawrence: same position, roughly the same player, nobody gains
+    me = core("m", qb=19.6)
+    target = core("t", qb=18.6)
+    fillers = [core(f"f{i}", qb=17 + i) for i in range(3)]
+    result = generate_trades(snapshot(me, target, fillers), 1, 2)
+    for group in list(result.values()) + [result.near_misses]:
+        for x in group:
+            assert not (len(x.send) == 1 and len(x.receive) == 1 and x.send[0].position == "QB" == x.receive[0].position)

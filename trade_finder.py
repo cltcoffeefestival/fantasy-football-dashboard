@@ -747,6 +747,7 @@ def _notes(send, receive) -> List[str]:
 # ------------------------------------------------------------------ generation
 
 NEAR_MISS_LIMIT = 3
+NEAR_MISS_MIN_GAIN = 0.2      # smaller than this isn't an edge worth a trade
 
 
 class TradeResults(dict):
@@ -767,7 +768,8 @@ FUNNEL_LABELS = {
     "their_lineup_worse": "make their lineup worse",
     "no_gain_for_you": "don't improve yours",
     "below_floor": "far too hard for them to accept",
-    "your_gain_too_small": "fair for both but your gain is under the tier bar",
+    "stretch_for_them": "a stretch for them and not big enough for you to be worth it",
+    "your_gain_too_small": "acceptable to them but your gain is under the tier bar",
     "qualified": "cleared a tier",
 }
 
@@ -783,6 +785,8 @@ def _funnel_reason(t: TradeProposal) -> str:
         return "no_gain_for_you"
     if t.mai < LONG_SHOT[1]:
         return "below_floor"
+    if t.mai < WORTH_A_SHOT[1]:
+        return "stretch_for_them"
     return "your_gain_too_small"
 
 
@@ -826,14 +830,16 @@ def generate_trades(
                 funnel["checked"] += 1
                 reason = _funnel_reason(t)
                 funnel[reason] += 1
-                if reason == "your_gain_too_small":
+                # a near miss is a trade they'd plausibly accept that gives you a small but real edge;
+                # lateral same-position swaps are never worth suggesting
+                if reason == "your_gain_too_small" and t.lat == 0 and t.my_effective_gain >= NEAR_MISS_MIN_GAIN:
                     misses.append(t)
                 if t.tier is None or (strict and t.mai < STRICT_MIN_MAI):
                     continue
                 candidates[t.tier].append(t)
     result.funnel = funnel
 
-    # closest misses: fair for both sides, but the gain for you is under the lowest tier bar
+    # closest misses: acceptable to them, but the gain for you is under the lowest tier bar
     misses.sort(key=lambda t: (-t.nmu, -t.mai))
     used_send, used_recv = set(), set()
     for t in misses:

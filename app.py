@@ -151,7 +151,7 @@ def render_misses(trades):
         st.caption("Nothing cleared a tier. " + "; ".join(parts) + ".")
     if trades.near_misses:
         with st.expander(f"Closest misses ({len(trades.near_misses)})", expanded=total == 0):
-            st.caption("Fair for both sides, but below the gain bar for a tier. Worth a look if you'd take a small edge.")
+            st.caption("Trades they would likely accept, but your gain is below the bar for a tier. Worth a look if you'd take a small edge.")
             for t in trades.near_misses:
                 st.markdown(f"⚪ {why_no_tier(t)}")
                 render_proposal(t)
