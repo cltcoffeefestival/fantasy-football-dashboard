@@ -402,3 +402,23 @@ def test_blocked_message_names_the_side_and_the_players():
     assert t.blocked and t.theirs.blocked and not t.mine.blocked
     msg = why_no_tier(t)
     assert msg.startswith("Blocked: They'd give up starter Tate for bench piece Loveland at TE")
+
+
+# ---- explaining an empty result
+
+def test_empty_result_explains_itself_and_offers_the_closest_misses():
+    # a fair swap that only nudges your lineup: no tier, but it should show up as a near miss
+    me = core("m", [P("mRB3", "RB", 13)])
+    for p in me:
+        if p.name == "mWR2":
+            p.weekly[:], p.base = [9.5] * WEEKS, 9.5
+    target = core("t", [P("tWR3", "WR", 10.5)])
+    for p in target:
+        if p.name == "tRB2":
+            p.weekly[:], p.base = [8.0] * WEEKS, 8.0
+    result = generate_trades(snapshot(me, target, [core(f"f{i}", te=13) for i in range(3)]), 1, 2)
+    assert result.funnel["checked"] > 0
+    assert sum(result.funnel[k] for k in result.funnel if k != "checked") == result.funnel["checked"]
+    for t in result.near_misses:
+        assert t.tier is None and not t.blocked and t.theirs.delta >= 0 and t.mine.delta > 0
+        assert t.you_why and why_no_tier(t)

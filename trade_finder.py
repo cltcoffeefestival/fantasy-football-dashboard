@@ -724,18 +724,60 @@ def _notes(send, receive) -> List[str]:
 
 # ------------------------------------------------------------------ generation
 
+NEAR_MISS_LIMIT = 3
+
+
+class TradeResults(dict):
+    """{tier: proposals} plus the closest misses and a count of why candidates were rejected"""
+
+    near_misses: List[TradeProposal]
+    funnel: Dict[str, int]
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.near_misses = []
+        self.funnel = {}
+
+
+FUNNEL_LABELS = {
+    "checked": "possible trades checked",
+    "blocked": "blocked (a starter for a redundant bench piece)",
+    "their_lineup_worse": "make their lineup worse",
+    "no_gain_for_you": "don't improve yours",
+    "below_floor": "far too hard for them to accept",
+    "your_gain_too_small": "fair for both but your gain is under the tier bar",
+    "qualified": "cleared a tier",
+}
+
+
+def _funnel_reason(t: TradeProposal) -> str:
+    if t.tier is not None:
+        return "qualified"
+    if t.blocked:
+        return "blocked"
+    if t.theirs.delta < 0:
+        return "their_lineup_worse"
+    if t.mine.delta <= 0:
+        return "no_gain_for_you"
+    if t.mai < LONG_SHOT[1]:
+        return "below_floor"
+    return "your_gain_too_small"
+
+
 def generate_trades(
     snapshot: LeagueSnapshot,
     my_id: int,
     target_id: int,
     strict: bool = False,
     per_tier: int = PER_TIER,
-) -> Dict[str, List[TradeProposal]]:
+) -> TradeResults:
     """Proposals in each acceptance tier for one target team, best mutual utility first.
 
-    strict=True keeps only trades the target clearly clears (MAI >= +1.5).
+    strict=True keeps only trades the target clearly clears (MAI >= +1.5). The result also carries
+    `near_misses` (fair trades that fall just short of a tier bar) and a `funnel` of rejection counts
+    so an empty result can be explained.
     """
-    result: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
+    result = TradeResults({t: [] for t in TIERS})
     if my_id not in snapshot.teams or target_id not in snapshot.teams or my_id == target_id:
         return result
 
@@ -752,13 +794,36 @@ def generate_trades(
 
     my_pool, their_pool = pool(tc.mine.team.players), pool(tc.theirs.team.players)
     candidates: Dict[str, List[TradeProposal]] = {t: [] for t in TIERS}
+    misses: List[TradeProposal] = []
+    funnel: Dict[str, int] = {key: 0 for key in FUNNEL_LABELS}
     for send_n, recv_n in [(1, 1), (2, 1), (1, 2), (2, 2)]:
         for send in combinations(my_pool, send_n):
             for receive in combinations(their_pool, recv_n):
                 t = tc.evaluate(list(send), list(receive))
+                funnel["checked"] += 1
+                reason = _funnel_reason(t)
+                funnel[reason] += 1
+                if reason == "your_gain_too_small":
+                    misses.append(t)
                 if t.tier is None or (strict and t.mai < STRICT_MIN_MAI):
                     continue
                 candidates[t.tier].append(t)
+    result.funnel = funnel
+
+    # closest misses: fair for both sides, but the gain for you is under the lowest tier bar
+    misses.sort(key=lambda t: (-t.nmu, -t.mai))
+    used_send, used_recv = set(), set()
+    for t in misses:
+        s_ids, r_ids = {id(p) for p in t.send}, {id(p) for p in t.receive}
+        if s_ids & used_send or r_ids & used_recv:
+            continue
+        t.you_why, t.them_why = explain(t)
+        tc.attach_lineups(t)
+        result.near_misses.append(t)
+        used_send |= s_ids
+        used_recv |= r_ids
+        if len(result.near_misses) >= NEAR_MISS_LIMIT:
+            break
 
     for tier, found in candidates.items():
         found.sort(key=lambda t: (-t.nmu, -t.mai))
