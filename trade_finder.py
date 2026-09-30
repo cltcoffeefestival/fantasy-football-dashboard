@@ -72,6 +72,7 @@ LATERAL_TAX = 1.5                 # same-position swaps give the target no reaso
 PLT_QB_TE_RATE = 0.5              # lost QB1/TE1: the lineup change already charges the loss, so this is extra
 TALENT_FLOOR_RATIO = 0.85         # the best player the target gets should be within 15% of its best player out
 TALENT_GAP_RATE = 0.5             # PPG penalty per PPG of talent gap beyond that
+SELL_LOW_RATE = 0.5               # your side: PPG deducted per PPG of talent you give beyond what you get back
 TALENT_GAP_HOLE_RATE = 0.25       # gentler when a different position's real hole is being filled
 REAL_MARGIN = 1.0                 # a player must beat the waiver pickup by this much to count as a real piece
 DRV_TOP_N = 3                     # replacement level = average of the best few free agents, not the single best
@@ -166,6 +167,7 @@ class TradeProposal:
     ap: float = 0.0
     lat: float = 0.0
     tfl: float = 0.0
+    sell_low: float = 0.0            # you'd be selling a much better player for a lesser one
     real_in_players: List[PlayerValue] = field(default_factory=list)   # players the target receives who would start for it
     real_in: int = 0                 # ... and how many
     real_out: int = 0                # players the target gives who are starters or beat one
@@ -182,7 +184,13 @@ class TradeProposal:
 
     @property
     def my_gain(self) -> float:
+        """Your raw lineup change (PPG)"""
         return self.mine.delta
+
+    @property
+    def my_effective_gain(self) -> float:
+        """Your lineup change after the sell-low penalty: what the trade is really worth to you"""
+        return self.mine.delta - self.sell_low
 
     @property
     def delta_lineup(self) -> float:
@@ -192,7 +200,7 @@ class TradeProposal:
     @property
     def nmu(self) -> float:
         """Net Mutual Utility: your lineup change plus the target's MAI"""
-        return self.mine.delta + self.mai
+        return self.my_effective_gain + self.mai
 
     @property
     def blocked(self) -> bool:
@@ -624,6 +632,13 @@ class TradeContext:
             fills_other_hole = theirs.solves_hole and any(p.position != top_out.position for p in send)
             tfl = (TALENT_GAP_HOLE_RATE if fills_other_hole else TALENT_GAP_RATE) * (best_out - best_in)
 
+        # Sell-low: don't give away your best player for a clearly lesser one just because your own
+        # lineup happens to have a surplus at his position (a spare QB, a deep RB room)
+        my_best_out, my_best_in = max(p.base for p in send), max(p.base for p in receive)
+        sell_low = (
+            SELL_LOW_RATE * (my_best_out - my_best_in) if my_best_in < TALENT_FLOOR_RATIO * my_best_out else 0.0
+        )
+
         t = TradeProposal(
             target_id=self.theirs.team.team_id,
             target_name=self.theirs.team.name,
@@ -631,7 +646,7 @@ class TradeContext:
             receive=list(receive),
             mine=mine,
             theirs=theirs,
-            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl, real_in=len(real_in), real_out=len(real_out), real_in_players=real_in,
+            tap=tap, bcp=bcp, tsp=tsp, plt=plt, ap=ap, lat=lat, tfl=tfl, sell_low=sell_low, real_in=len(real_in), real_out=len(real_out), real_in_players=real_in,
             alpha_assets=alpha,
             notes=_notes(send, receive),
         )
@@ -646,9 +661,9 @@ class TradeContext:
             impact.lineup_after = lineup_rows(impact.after_roster, slots, self.ctx, self.n)
 
     def _assign_tier(self, t: TradeProposal) -> Optional[str]:
-        if t.blocked or t.theirs.delta < 0 or t.mine.delta <= 0:
+        if t.blocked or t.theirs.delta < 0 or t.my_effective_gain <= 0:
             return None
-        mai, mine = t.mai, t.mine.delta
+        mai, mine = t.mai, t.my_effective_gain
         simple = (len(t.send), len(t.receive)) in ((1, 1), (2, 2))
         mutual_holes = t.mine.solves_hole and t.theirs.solves_hole
         no_redundancy = not t.mine.redundant and not t.theirs.redundant
@@ -692,9 +707,15 @@ def why_no_tier(t: TradeProposal) -> str:
         return blocked_reason(t)
     if t.theirs.delta < 0:
         return f"Their lineup gets worse ({t.theirs.delta:+.1f} PPG), so they have no reason to accept."
-    if t.mine.delta <= 0:
+    if t.sell_low and t.my_effective_gain <= 0:
+        return (
+            f"You'd be selling {max(t.send, key=lambda p: p.base).name} ({max(p.base for p in t.send):.1f} PPG) "
+            f"for a much lesser {max(t.receive, key=lambda p: p.base).name} ({max(p.base for p in t.receive):.1f}). "
+            f"Your lineup barely changes ({t.mine.delta:+.1f}), but you'd be giving away value (sell-low {-t.sell_low:+.1f})."
+        )
+    if t.my_effective_gain <= 0:
         return f"It doesn't improve your lineup ({t.mine.delta:+.1f} PPG)."
-    mai, mine = t.mai, t.mine.delta
+    mai, mine = t.mai, t.my_effective_gain
     if mai < LONG_SHOT[1]:
         return f"Their acceptance score is {mai:+.1f}, below the {LONG_SHOT[1]:+.1f} floor for even a Long Shot."
     if mai >= WIN_WIN[1]:
@@ -758,7 +779,7 @@ def _funnel_reason(t: TradeProposal) -> str:
         return "blocked"
     if t.theirs.delta < 0:
         return "their_lineup_worse"
-    if t.mine.delta <= 0:
+    if t.my_effective_gain <= 0:
         return "no_gain_for_you"
     if t.mai < LONG_SHOT[1]:
         return "below_floor"
@@ -893,6 +914,11 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         you.append(f"you give up {_names(t.mine.lost_starters)} from your lineup and still net {t.mine.delta:+.1f} PPG")
     if t.mine.drops:
         you.append(f"you'd cut {_names(t.mine.drops)} to make room")
+    if t.sell_low:
+        you.append(
+            f"caution: you'd be selling {max(t.send, key=lambda p: p.base).name} for a much lesser "
+            f"{max(t.receive, key=lambda p: p.base).name} (sell-low -{t.sell_low:.1f})"
+        )
     dup = [pos for pos in ("QB", "TE") if pos in {p.position for p in t.mine.redundant}]
     you.append(
         "avoids QB/TE duplication" if not t.mine.redundant

@@ -438,3 +438,30 @@ def test_lowering_the_minimum_gain_lets_a_small_but_fair_trade_through():
     lower = generate_trades(snap, 1, 2, min_gain=0.1)
     assert sum(len(v) for v in lower.values()) >= sum(len(v) for v in strict_bar.values())
     assert all(t.my_gain >= 0.1 for ps in lower.values() for t in ps)
+
+
+# ---- selling low: a spare elite player shouldn't be given away (Josh Allen for Mike Evans)
+
+def test_selling_an_elite_spare_qb_for_a_lesser_wr_is_not_recommended():
+    me = core("m", [P("Allen", "QB", 25.9)], qb=22.4)                 # two elite QBs, one QB slot
+    for p in me:
+        if p.name == "mWR2":
+            p.weekly[:], p.base = [9.0] * WEEKS, 9.0
+    target = core("t", [P("Evans", "WR", 13.6)], qb=16.1)
+    fillers = [core(f"f{i}", qb=17 + i) for i in range(3)]
+    tc = TradeContext(snapshot(me, target, fillers), 1, 2)
+    t = tc.evaluate([p for p in me if p.name == "Allen"], [p for p in target if p.name == "Evans"])
+    assert t.mine.delta > -1.0                        # the spare QB barely matters to your lineup...
+    assert t.sell_low > 5.0                           # ...but you'd be giving away 25.9 for 13.6
+    assert t.my_effective_gain < 0 and t.tier is None
+    assert "selling" in why_no_tier(t) and "Allen" in why_no_tier(t)
+    result = generate_trades(snapshot(me, target, fillers), 1, 2)
+    assert all(
+        not (len(x.send) == 1 and x.send[0].name == "Allen" and x.receive[0].name == "Evans")
+        for group in list(result.values()) + [result.near_misses] for x in group
+    )
+
+
+def test_an_even_talent_swap_has_no_sell_low_penalty():
+    snap = pair([P("a", "WR", 13)], [P("x", "WR", 12)])
+    assert evaluate(snap, ["a"], ["x"]).sell_low == 0.0

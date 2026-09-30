@@ -121,7 +121,9 @@ def render_proposal(t, why_label=None):
         friction = ", ".join(f"{PENALTY_LABELS[n]} −{v:.1f}" for n, v in t.penalties) or "none"
         st.markdown(
             "**Impact Breakdown**\n"
-            f"- **Your Team:** net starting gain **{t.my_gain:+.1f} PPG** · positions fixed: {fixed} · displaced: {displaced}\n"
+            f"- **Your Team:** net starting gain **{t.my_gain:+.1f} PPG**"
+            + (f" · sell-low −{t.sell_low:.1f} (worth {t.my_effective_gain:+.1f} to you)" if t.sell_low else "")
+            + f" · positions fixed: {fixed} · displaced: {displaced}\n"
             f"- **Target Team:** MAI **{t.mai:+.1f} PPG** · net lineup Δ {t.delta_lineup:+.1f} PPG · "
             f"friction penalties: {friction}"
             + (f" · structure judged as {t.real_in}-for-{t.real_out} on real pieces"
