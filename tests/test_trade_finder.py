@@ -289,8 +289,9 @@ class _League:
 def test_replacement_level_averages_the_top_three_healthy_free_agents():
     pts = {pos: [(1.0, "ACTIVE")] for pos in FALLBACK_DRV}
     pts["WR"] = [(30.0, "OUT"), (12.0, "ACTIVE"), (10.0, "ACTIVE"), (8.0, "ACTIVE"), (2.0, "ACTIVE")]
-    drv, live = fetch_drv(_League(pts), 5)
+    drv, live, sources = fetch_drv(_League(pts), 5)
     assert abs(drv["WR"] - 10.0) < 1e-9 and live
+    assert [round(f[1]) for f in sources["WR"]] == [12, 10, 8]
 
 
 # ---- effective structure and bench-level pieces (feedback on the Bowers+Corum and Kyler trades)

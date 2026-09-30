@@ -129,6 +129,8 @@ class LeagueSnapshot:
     schedule_adjusted: bool
     drv: Dict[str, float] = field(default_factory=lambda: dict(FALLBACK_DRV))
     drv_live: bool = False     # True when DRV came from the league's actual free agents
+    drv_sources: Dict[str, List[Tuple[str, float, float, float]]] = field(default_factory=dict)
+    # position -> the free agents behind the waiver level: (name, blended PPG, season avg, projection)
 
 
 @dataclass
@@ -859,36 +861,39 @@ def _fetch_ratings(league, weeks: List[int]) -> Dict[int, Dict[str, Dict[str, in
     return out
 
 
-def fetch_drv(league, week: int) -> Tuple[Dict[str, float], bool]:
+def fetch_drv(league, week: int):
     """Waiver PPG at each position from the league's actual free agents.
 
     The average of the best DRV_TOP_N healthy free agents, so one hot pickup or odd projection
-    can't move every gain and penalty. Returns (drv, live). Positions whose lookup fails fall
-    back to FALLBACK_DRV, and live is False unless every position came from real free agents.
+    can't move every gain and penalty. Returns (drv, live, sources): positions whose lookup fails
+    fall back to FALLBACK_DRV, live is False unless every position came from real free agents, and
+    sources lists the free agents behind each level so the number can be checked by eye.
     """
     drv = dict(FALLBACK_DRV)
     live = True
+    sources: Dict[str, List[Tuple[str, float, float, float]]] = {}
     for pos in FALLBACK_DRV:
         try:
-            values = []
+            found = []
             for fa in league.free_agents(week=week, size=25, position=pos):
                 status = (getattr(fa, "injuryStatus", "") or "ACTIVE").upper()
                 if status in ("OUT", "INJURY_RESERVE", "SUSPENSION"):
                     continue
-                values.append(base_points(
-                    getattr(fa, "avg_points", 0),
-                    getattr(fa, "projected_avg_points", 0),
-                    getattr(fa, "total_points", 0),
-                ))
-            top = sorted((v for v in values if v > 0), reverse=True)[:DRV_TOP_N]
+                avg = getattr(fa, "avg_points", 0) or 0.0
+                proj = getattr(fa, "projected_avg_points", 0) or 0.0
+                blended = base_points(avg, proj, getattr(fa, "total_points", 0))
+                if blended > 0:
+                    found.append((getattr(fa, "name", "?"), blended, avg, proj))
+            top = sorted(found, key=lambda f: f[1], reverse=True)[:DRV_TOP_N]
             if top:
-                drv[pos] = sum(top) / len(top)
+                drv[pos] = sum(f[1] for f in top) / len(top)
+                sources[pos] = top
             else:
                 live = False
         except Exception as e:
             logger.warning(f"Could not load free agents for {pos}: {e}")
             live = False
-    return drv, live
+    return drv, live, sources
 
 
 def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnapshot:
@@ -896,7 +901,7 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
     current = getattr(league, "current_week", None) or getattr(league, "nfl_week", 1)
     weeks = list(range(current, min(current + weeks_ahead, SEASON_LAST_WEEK + 1)))
     ratings = _fetch_ratings(league, weeks)
-    drv, drv_live = fetch_drv(league, current)
+    drv, drv_live, drv_sources = fetch_drv(league, current)
 
     teams = {}
     for team in league.teams:
@@ -914,4 +919,5 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
         schedule_adjusted=bool(ratings),
         drv=drv,
         drv_live=drv_live,
+        drv_sources=drv_sources,
     )

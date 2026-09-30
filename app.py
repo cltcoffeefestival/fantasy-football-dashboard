@@ -431,6 +431,18 @@ def main():
             st.caption(
                 "Waiver levels used: " + ", ".join(f"{pos} {value:.1f}" for pos, value in snapshot.drv.items())
             )
+            with st.expander("Free agents behind the waiver levels"):
+                st.caption(
+                    "Each waiver level is the average of the best few healthy free agents at the position. "
+                    "PPG blends season average and projection; compare it with your Waiver Wire page."
+                )
+                rows = [
+                    {"Position": pos, "Free agent": name, "PPG used": round(blend, 1),
+                     "Season avg": round(avg, 1), "Projection": round(proj, 1)}
+                    for pos, found in snapshot.drv_sources.items()
+                    for name, blend, avg, proj in found
+                ]
+                st.dataframe(rows, width="stretch", hide_index=True)
             others = {t.name: tid for tid, t in snapshot.teams.items() if tid != team_id}
 
             with st.expander("Your roster by position"):
