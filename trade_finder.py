@@ -76,8 +76,12 @@ SELL_LOW_RATE = 0.5               # your side: PPG deducted per PPG of talent yo
 TALENT_GAP_HOLE_RATE = 0.25       # gentler when a different position's real hole is being filled
 REAL_MARGIN = 1.0                 # a player must beat the waiver pickup by this much to count as a real piece
 DRV_TOP_N = 3                     # replacement level = average of the best few free agents, not the single best
+# A waiver pickup's projection is an average over players you can't all roster and can't count on week to
+# week (a QB averaging 15 on waivers is not a guaranteed 15), while a rostered starter is a known quantity.
+# The league's replacement level is therefore discounted when it's built from live free agents.
+WAIVER_RELIABILITY = 0.9
 NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
-QB_GAIN_HAIRCUT = 0.5             # owners discount QB upgrades in 1QB leagues: waiver QBs are plentiful
+QB_GAIN_HAIRCUT = 0.5             # owners discount a QB that only beats waiver QBs (no rostered QB to upgrade)
 # S-tier (Tier-1 Alpha) = top N rostered players at the position across the league
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}
 STRICT_MIN_MAI = 1.5         # the "strict acceptance" filter: only trades the target clearly clears
@@ -519,7 +523,10 @@ class TradeContext:
         # excluded players are still on the roster (bench), they just can't start
         delta = lineup_ppg(roster, self.ctx, self.n) - side.before
         perceived = delta
-        if "QB" in self.single:
+        # an upgrade over the QB the owner actually has is a real upgrade, not a streaming pickup
+        qb_in = max((p.base for p in incoming if p.position == "QB" and id(p) not in excluded_ids), default=0.0)
+        own_qb = max((p.base for p in base_roster if p.position == "QB"), default=None)
+        if "QB" in self.single and not (own_qb is not None and qb_in > own_qb):
             qb_gain = max(0.0, single_slot_ppg(roster, "QB", self.drv, self.n) - side.qb_before)
             perceived = delta - QB_GAIN_HAIRCUT * qb_gain
 
@@ -608,6 +615,8 @@ class TradeContext:
         for p in receive:
             if id(p) not in self.theirs.starters or p.position in incoming_starter_positions:
                 continue
+            if p.position == "TE":
+                continue    # the lineup change already charges losing a TE; no extra tax on top
             over = max(0.0, p.base - self.drv.get(p.position, 0.0))
             if p.position in self.single and p.base >= max(
                 (q.base for q in self.theirs.team.players if id(q) in self.theirs.starters and q.position == p.position),
@@ -1031,6 +1040,7 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
     weeks = list(range(current, min(current + weeks_ahead, SEASON_LAST_WEEK + 1)))
     ratings = _fetch_ratings(league, weeks)
     drv, drv_live, drv_sources = fetch_drv(league, current)
+    drv = {pos: (value * WAIVER_RELIABILITY if pos in drv_sources else value) for pos, value in drv.items()}
 
     teams = {}
     for team in league.teams:

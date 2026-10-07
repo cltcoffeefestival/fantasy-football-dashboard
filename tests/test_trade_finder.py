@@ -238,12 +238,22 @@ def test_two_for_one_and_two_for_two_never_reach_win_win():
     assert evaluate(snap, ["mRB3", "mRB4"], ["tWR3"]).tsp == TSP_TARGET_RECEIVES_MORE
 
 
-def test_qb_upgrades_count_half_for_the_target_in_one_qb_leagues():
+def test_qb_upgrade_over_the_targets_own_qb_counts_in_full():
     snap = league_with([P("mQB2", "QB", 21)], [], target_kw={"qb": 14})
     t = evaluate(snap, ["mQB2"], ["tRB2"])
-    qb_gain = 21 - 14
-    assert abs((t.theirs.delta - t.theirs.perceived) - QB_GAIN_HAIRCUT * qb_gain) < 0.75
+    assert t.theirs.perceived == t.theirs.delta
+
+
+def test_qb_that_only_beats_waivers_counts_half_for_the_target():
+    snap = league_with([P("mQB2", "QB", 21)], [], target_kw={"qb": 14})
+    snap.teams[2].players = [p for p in snap.teams[2].players if p.position != "QB"]
+    t = evaluate(snap, ["mQB2"], ["tRB2"])
     assert t.theirs.perceived < t.theirs.delta
+
+
+def test_losing_a_te_is_not_taxed_on_top_of_the_lineup_change():
+    snap = pair([P("aWR", "WR", 13)], [], qb=17)
+    assert evaluate(snap, ["aWR"], ["tTE"]).plt == 0.0
 
 
 # ---- talent floor, candidate pools and replacement level
@@ -477,3 +487,18 @@ def test_a_lateral_qb_swap_is_never_a_near_miss():
     for group in list(result.values()) + [result.near_misses]:
         for x in group:
             assert not (len(x.send) == 1 and len(x.receive) == 1 and x.send[0].position == "QB" == x.receive[0].position)
+
+
+def test_live_waiver_levels_are_discounted_for_week_to_week_unreliability():
+    from types import SimpleNamespace
+    from trade_finder import WAIVER_RELIABILITY, build_league_snapshot
+
+    pts = {pos: [(10.0, "ACTIVE")] for pos in FALLBACK_DRV}
+    league = _League(pts)
+    league.current_week = 5
+    league.teams = []
+    league.settings = SimpleNamespace(position_slot_counts={"QB": 1})
+    league.nfl_week = 5
+    snap = build_league_snapshot(league)
+    assert abs(snap.drv["QB"] - 10.0 * WAIVER_RELIABILITY) < 1e-9
+    assert snap.drv_sources["QB"][0][1] == 10.0     # the free agents shown are undiscounted
