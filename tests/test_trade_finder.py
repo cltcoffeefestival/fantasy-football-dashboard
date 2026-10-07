@@ -477,3 +477,18 @@ def test_a_lateral_qb_swap_is_never_a_near_miss():
     for group in list(result.values()) + [result.near_misses]:
         for x in group:
             assert not (len(x.send) == 1 and len(x.receive) == 1 and x.send[0].position == "QB" == x.receive[0].position)
+
+
+def test_live_waiver_levels_are_discounted_for_week_to_week_unreliability():
+    from types import SimpleNamespace
+    from trade_finder import WAIVER_RELIABILITY, build_league_snapshot
+
+    pts = {pos: [(10.0, "ACTIVE")] for pos in FALLBACK_DRV}
+    league = _League(pts)
+    league.current_week = 5
+    league.teams = []
+    league.settings = SimpleNamespace(position_slot_counts={"QB": 1})
+    league.nfl_week = 5
+    snap = build_league_snapshot(league)
+    assert abs(snap.drv["QB"] - 10.0 * WAIVER_RELIABILITY) < 1e-9
+    assert snap.drv_sources["QB"][0][1] == 10.0     # the free agents shown are undiscounted

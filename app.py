@@ -454,7 +454,8 @@ def main():
             )
             with st.expander("Free agents behind the waiver levels"):
                 st.caption(
-                    "Each waiver level is the average of the best few healthy free agents at the position. "
+                    "Each waiver level is the average of the best few healthy free agents at the position, "
+                    "discounted 10% because a waiver pickup isn't a sure thing week to week. "
                     "PPG blends season average and projection; compare it with your Waiver Wire page."
                 )
                 rows = [
