@@ -500,5 +500,7 @@ def test_live_waiver_levels_are_discounted_for_week_to_week_unreliability():
     league.settings = SimpleNamespace(position_slot_counts={"QB": 1})
     league.nfl_week = 5
     snap = build_league_snapshot(league)
-    assert abs(snap.drv["QB"] - 10.0 * WAIVER_RELIABILITY) < 1e-9
+    assert abs(snap.drv["QB"] - 10.0 * WAIVER_RELIABILITY["QB"]) < 1e-9
+    assert abs(snap.drv["WR"] - 10.0 * WAIVER_RELIABILITY["WR"]) < 1e-9
+    assert snap.drv["K"] == 10.0
     assert snap.drv_sources["QB"][0][1] == 10.0     # the free agents shown are undiscounted

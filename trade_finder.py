@@ -79,7 +79,9 @@ DRV_TOP_N = 3                     # replacement level = average of the best few 
 # A waiver pickup's projection is an average over players you can't all roster and can't count on week to
 # week (a QB averaging 15 on waivers is not a guaranteed 15), while a rostered starter is a known quantity.
 # The league's replacement level is therefore discounted when it's built from live free agents.
-WAIVER_RELIABILITY = 0.9
+# Only QBs are really streamable in a trade context; an RB/WR/TE off waivers rarely replaces a real
+# starter, so those levels are discounted much harder. K and D/ST are never traded for.
+WAIVER_RELIABILITY = {"QB": 0.9, "RB": 0.5, "WR": 0.5, "TE": 0.5}
 NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
 QB_GAIN_HAIRCUT = 0.5             # owners discount a QB that only beats waiver QBs (no rostered QB to upgrade)
 # S-tier (Tier-1 Alpha) = top N rostered players at the position across the league
@@ -1040,7 +1042,7 @@ def build_league_snapshot(league, weeks_ahead: int = WEEKS_AHEAD) -> LeagueSnaps
     weeks = list(range(current, min(current + weeks_ahead, SEASON_LAST_WEEK + 1)))
     ratings = _fetch_ratings(league, weeks)
     drv, drv_live, drv_sources = fetch_drv(league, current)
-    drv = {pos: (value * WAIVER_RELIABILITY if pos in drv_sources else value) for pos, value in drv.items()}
+    drv = {pos: (value * WAIVER_RELIABILITY.get(pos, 1.0) if pos in drv_sources else value) for pos, value in drv.items()}
 
     teams = {}
     for team in league.teams:
