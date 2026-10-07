@@ -413,3 +413,20 @@ def test_every_proposal_carries_a_full_quality_breakdown():
     for needed in ("Lineup", "Value in / out", "Shape", "Need solved", "Best player out", "Total"):
         assert needed in labels
     assert t.confidence in ("high", "medium", "low") and t.works_because and t.fails_because
+
+
+def test_the_targets_spare_qb_is_not_valued_like_a_starter():
+    # the classic deal: they have two starting QBs, I need one, I send an RB that starts for them
+    me = core("m", [P("mRB3", "RB", 9.5)], qb=15.9)
+    target = core("t", [P("Stafford", "QB", 16.5), P("tWR3", "WR", 11)], qb=18.0, rb=(14, 6.7))
+    t = evaluate(snapshot(me, target), ["mRB3"], ["Stafford"])
+    assert t.theirs.best_out_share < 0.5                          # Stafford rode their bench
+    assert t.theirs.lineup_delta > 0 and t.acceptance > 0.5 and t.tier is not None
+    assert "backup" in t.them_why or "bench" in t.fails_because or t.theirs.value_delta >= 0
+
+
+def test_the_targets_starting_qb_still_counts_in_full():
+    me = core("m", [P("mRB3", "RB", 9.5)], qb=15.9)
+    target = core("t", rb=(14, 6.7), qb=18.0)
+    t = evaluate(snapshot(me, target), ["mRB3"], ["tQB"])
+    assert t.theirs.lineup_delta < 0 and t.acceptance < -2 and t.tier is None
