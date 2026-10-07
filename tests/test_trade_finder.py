@@ -238,12 +238,22 @@ def test_two_for_one_and_two_for_two_never_reach_win_win():
     assert evaluate(snap, ["mRB3", "mRB4"], ["tWR3"]).tsp == TSP_TARGET_RECEIVES_MORE
 
 
-def test_qb_upgrades_count_half_for_the_target_in_one_qb_leagues():
+def test_qb_upgrade_over_the_targets_own_qb_counts_in_full():
     snap = league_with([P("mQB2", "QB", 21)], [], target_kw={"qb": 14})
     t = evaluate(snap, ["mQB2"], ["tRB2"])
-    qb_gain = 21 - 14
-    assert abs((t.theirs.delta - t.theirs.perceived) - QB_GAIN_HAIRCUT * qb_gain) < 0.75
+    assert t.theirs.perceived == t.theirs.delta
+
+
+def test_qb_that_only_beats_waivers_counts_half_for_the_target():
+    snap = league_with([P("mQB2", "QB", 21)], [], target_kw={"qb": 14})
+    snap.teams[2].players = [p for p in snap.teams[2].players if p.position != "QB"]
+    t = evaluate(snap, ["mQB2"], ["tRB2"])
     assert t.theirs.perceived < t.theirs.delta
+
+
+def test_losing_a_te_is_not_taxed_on_top_of_the_lineup_change():
+    snap = pair([P("aWR", "WR", 13)], [], qb=17)
+    assert evaluate(snap, ["aWR"], ["tTE"]).plt == 0.0
 
 
 # ---- talent floor, candidate pools and replacement level
