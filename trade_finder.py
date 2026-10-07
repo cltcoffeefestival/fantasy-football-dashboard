@@ -165,6 +165,7 @@ class SideImpact:
     upgrades: List[Tuple[PlayerValue, Optional[PlayerValue], float]] = field(default_factory=list)
     start_share: Dict[int, float] = field(default_factory=dict)   # id(player) -> share of weeks he starts (after)
     drops: List[PlayerValue] = field(default_factory=list)       # bench players cut to make room
+    outgoing: List[PlayerValue] = field(default_factory=list)    # what the side gives up
     lost_starters: List[PlayerValue] = field(default_factory=list)
     redundant: List[PlayerValue] = field(default_factory=list)   # incoming players who would rarely start
     best_out: Optional[PlayerValue] = None               # the most valuable player the side gives up
@@ -598,6 +599,8 @@ class TradeContext:
         slot_notes, need_solved = {}, []
         for p, displaced, _ in upgrades:
             level = self.levels.get(p.position, 0.0)
+            if displaced is not None and id(displaced) in out_ids:
+                continue      # he takes the slot a traded player leaves: not a hole fixed
             if displaced is None:
                 slot_notes[id(p)] = f"{whose} roster has nobody to play, so it was filled from waivers ({self.drv.get(p.position, 0.0):.1f} PPG)"
                 need_solved.append(p.position)
@@ -628,6 +631,7 @@ class TradeContext:
             upgrades=upgrades,
             start_share=shares,
             drops=drops,
+            outgoing=list(outgoing),
             lost_starters=lost,
             redundant=redundant,
             best_out=max(outgoing, key=lambda p: asset_value(p, self.levels), default=None),
@@ -642,21 +646,31 @@ class TradeContext:
         )
 
     def _upgrades(self, side: Side, incoming_starters, out_ids, shares):
-        """Which of the side's starters each incoming starter displaces (None = a slot nobody could fill)"""
-        pool = sorted(
+        """Which of the side's starters each incoming starter displaces.
+
+        Starters the side keeps but who no longer start are matched first (a real upgrade over them);
+        then starters leaving in the trade (the newcomer takes the slot they vacate); None only when
+        the slot really had nobody (it was filled from waivers before).
+        """
+        benched = sorted(
             (p for p in side.team.players
              if id(p) in side.starters and id(p) not in out_ids and shares.get(id(p), 0.0) < 0.5),
             key=lambda p: p.base,
         )
+        leaving = sorted((p for p in side.team.players if id(p) in side.starters and id(p) in out_ids), key=lambda p: p.base)
         upgrades = []
         for p in sorted(incoming_starters, key=lambda p: p.base, reverse=True):
-            match = next((d for d in pool if d.position == p.position), None) or (pool[0] if pool else None)
+            match = next((d for d in benched if d.position == p.position), None) or (benched[0] if benched else None)
             if match is not None:
-                pool.remove(match)
-                gain = max(0.0, p.base - match.base)
+                benched.remove(match)
+                upgrades.append((p, match, max(0.0, p.base - match.base)))
+                continue
+            vacated = next((d for d in leaving if d.position == p.position), None) or (leaving[0] if leaving else None)
+            if vacated is not None:
+                leaving.remove(vacated)
+                upgrades.append((p, vacated, p.base - vacated.base))
             else:
-                gain = max(0.0, p.base - self.drv.get(p.position, 0.0))
-            upgrades.append((p, match, gain))
+                upgrades.append((p, None, max(0.0, p.base - self.drv.get(p.position, 0.0))))
         return upgrades
 
     def evaluate(self, send: List[PlayerValue], receive: List[PlayerValue]) -> TradeProposal:
@@ -965,12 +979,17 @@ def positions_fixed(side: SideImpact) -> List[str]:
 
 
 def displaced_players(side: SideImpact) -> List[PlayerValue]:
-    return [d for _, d, _ in side.upgrades if d is not None]
+    out_ids = {id(p) for p in side.outgoing}
+    return [d for _, d, _ in side.upgrades if d is not None and id(d) not in out_ids]
 
 
 def _upgrade_text(side: SideImpact) -> str:
     parts = []
+    out_ids = {id(p) for p in side.outgoing}
     for p, displaced, gain in side.upgrades:
+        if displaced is not None and id(displaced) in out_ids:
+            parts.append(f"{p.name} ({p.base:.1f} PPG) takes the {p.position} spot {displaced.name} ({displaced.base:.1f}) leaves, {gain:+.1f} PPG")
+            continue
         over = (
             f"over {displaced.name} ({displaced.base:.1f})"
             if displaced else f"in a slot where {side.slot_notes.get(id(p), 'a waiver pickup would otherwise play')}"

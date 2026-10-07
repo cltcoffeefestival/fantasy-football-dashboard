@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_finder import (  # noqa: E402
     CONVEXITY, ENDOWMENT, FALLBACK_DRV, HASSLE, RAW_POINTS_ANCHOR, VALUE_WEIGHT, LeagueSnapshot, PlayerValue, TeamSnapshot,
     TradeContext, asset_value, breakdown, build_slots, fetch_drv, generate_trades, lineup_ppg,
-    single_slot_positions, slot_context, starter_levels, wanted_players, why_no_tier,
+    explain, single_slot_positions, slot_context, starter_levels, wanted_players, why_no_tier,
 )
 
 SLOTS = build_slots({"QB": 1, "RB": 2, "WR": 2, "TE": 1, "RB/WR/TE": 1, "D/ST": 1, "K": 1, "BE": 6})
@@ -430,3 +430,16 @@ def test_the_targets_starting_qb_still_counts_in_full():
     target = core("t", rb=(14, 6.7), qb=18.0)
     t = evaluate(snapshot(me, target), ["mRB3"], ["tQB"])
     assert t.theirs.lineup_delta < 0 and t.acceptance < -2 and t.tier is None
+
+
+def test_a_newcomer_taking_a_traded_players_slot_is_not_a_hole_filled():
+    # Wilson (WR, their flex is Jones) for Jones + Stevenson: Wilson takes the flex Jones leaves,
+    # he does not "fill a slot nobody could play"
+    me = core("m", [P("Wilson", "WR", 14.9), P("mRB3", "RB", 9.1), P("Hollins", "WR", 6)], rb=(12, 9.1), wr=(15.8, 14.9))
+    me = [p for p in me if p.name != "mWR2"]
+    target = core("t", [P("Jones", "RB", 12.3), P("Stevenson", "RB", 12.0)], rb=(16, 12.3), wr=(18, 16))
+    target = [p for p in target if p.name != "tRB2"]
+    t = evaluate(snapshot(me, target), ["Wilson"], ["Jones", "Stevenson"])
+    assert "WR" not in t.theirs.need_solved
+    assert "nobody to play" not in t.them_why and "nobody to play" not in t.you_why
+    assert "leaves" in explain(t)[1] or "over" in explain(t)[1]
