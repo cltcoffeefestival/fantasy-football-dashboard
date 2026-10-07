@@ -7,7 +7,7 @@ A comprehensive web dashboard to analyze your ESPN Fantasy Football teams across
 - **Dashboard**: team cards for every league, sorted by standing, with your own teams highlighted
 - **My Teams**: record, standing, points per week and the roster grouped by position
 - **Waiver Wire**: best available free agent at each position, plus a filterable free agent table
-- **Trade Finder**: finds trades that work for both managers. Your side is scored by net starting-lineup gain; theirs by the Manager Acceptance Index (lineup change minus Alpha tax, bench clutter, trade structure and lost QB1/TE1 penalties). Proposes Win-Win, Worth a Shot and Long Shot trades for any team (or every team), and scores trades you type in
+- **Trade Finder**: finds trades that work for both managers. Each side is scored on starting-lineup change plus asset value (PPG above the league's last starter, convex so stars count more), and the other manager is also charged package hassle and sideways-swap friction. Proposes Win-Win, Worth a Shot and Long Shot trades for any team (or every team), scores trades you type in, and shows a full quality breakdown per trade (see `docs/trade_engine_audit.md`)
 - **Team Analysis**: team summary
 - **Standings**: points-for chart and full standings for each league
 
@@ -70,7 +70,8 @@ fantasy-football-dashboard/
 ├── assets/style.css     # Shared styling
 ├── league_manager.py    # ESPN API integration
 ├── analyzer.py          # Analysis and recommendations
-├── trade_finder.py      # Trade engine (MAI scoring, lineups, trade generation)
+├── trade_finder.py      # Trade engine (lineup + asset value + friction, trade generation)
+├── docs/                # Trade engine audit and design notes
 ├── tests/               # pytest suite for the trade engine
 ├── config.py            # League IDs and settings
 ├── .streamlit/          # Theme and secrets template

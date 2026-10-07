@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    DEFAULT_MIN_GAIN, FUNNEL_LABELS, PENALTY_LABELS, positions_fixed, why_no_tier,
+    DEFAULT_MIN_GAIN, FUNNEL_LABELS, asset_value, breakdown, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -78,8 +78,8 @@ def md_escape(text):
     return re.sub(r"([*_`~\[\]])", r"\\\1", str(text))
 
 
-def player_values_table(team, drv):
-    """What the model sees for each player: PPG, window average, injury, weeks at zero"""
+def player_values_table(team, levels):
+    """What the model sees for each player: PPG, window average, asset value, injury, weeks at zero"""
     rows = []
     for p in sorted(team.players, key=lambda p: (p.position, -p.base)):
         rows.append({
@@ -87,7 +87,8 @@ def player_values_table(team, drv):
             "Pos": p.position,
             "PPG": round(p.base, 1),
             "Window avg": round(p.avg, 1),
-            "Above waiver": round(p.base - drv.get(p.position, 0.0), 1),
+            "Above last starter": round(p.base - levels.get(p.position, 0.0), 1),
+            "Asset value": round(asset_value(p, levels), 1),
             "Injury": "" if not p.injured else p.injury.replace("_", " ").title(),
             "Zero weeks": sum(1 for w in p.weekly if w == 0),
         })
@@ -118,20 +119,26 @@ def render_proposal(t, why_label=None):
 
         fixed = ", ".join(positions_fixed(t.mine)) or "none"
         displaced = ", ".join(f"{p.name} ({p.base:.1f})" for p in displaced_players(t.mine)) or "none"
-        friction = ", ".join(f"{PENALTY_LABELS[n]} −{v:.1f}" for n, v in t.penalties) or "none"
         st.markdown(
             "**Impact Breakdown**\n"
-            f"- **Your Team:** net starting gain **{t.my_gain:+.1f} PPG**"
-            + (f" · sell-low −{t.sell_low:.1f} (worth {t.my_effective_gain:+.1f} to you)" if t.sell_low else "")
-            + f" · positions fixed: {fixed} · displaced: {displaced}\n"
-            f"- **Target Team:** MAI **{t.mai:+.1f} PPG** · net lineup Δ {t.delta_lineup:+.1f} PPG · "
-            f"friction penalties: {friction}"
-            + (f" · structure judged as {t.real_in}-for-{t.real_out} on real pieces"
-               if (t.real_in, t.real_out) != (len(t.send), len(t.receive)) else "")
-            + "\n"
-            f"- **Net Mutual Utility:** {t.nmu:+.1f} PPG"
+            f"- **You:** lineup **{t.my_gain:+.1f} PPG** · value {t.mine.value_delta * 0.5:+.1f} · "
+            f"worth **{t.my_effective_gain:+.1f}** to you · positions fixed: {fixed} · displaced: {displaced}\n"
+            f"- **{md_escape(t.target_name)}:** lineup {t.delta_lineup:+.1f} PPG · value {t.theirs.value_delta * 0.5:+.1f}"
+            + (f" · hassle −{t.theirs.hassle:.1f}" if t.theirs.hassle else "")
+            + f" · acceptance **{t.acceptance:+.1f}**\n"
+            f"- **Mutual:** {t.nmu:+.1f} · confidence: {t.confidence}\n"
+            f"- **Works because:** {md_escape(t.works_because)}\n"
+            f"- **Might fail because:** {md_escape(t.fails_because)}"
         )
         st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {md_escape(t.you_why)}\n- **Why it works for them:** {md_escape(t.them_why)}")
+        with st.expander("Trade quality breakdown"):
+            c1, c2 = st.columns(2)
+            with c1:
+                st.markdown("**You**")
+                st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.mine, False)], width="stretch", hide_index=True)
+            with c2:
+                st.markdown(f"**{md_escape(t.target_name)}**")
+                st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.theirs, True)], width="stretch", hide_index=True)
         with st.expander("Lineup before → after"):
             lineup_table("You", t.mine)
             lineup_table(t.target_name, t.theirs)
@@ -450,13 +457,16 @@ def main():
                    else "⚠️ matchup ratings unavailable")
             )
             st.caption(
-                "Waiver levels used: " + ", ".join(f"{pos} {value:.1f}" for pos, value in snapshot.drv.items())
+                "Last-starter levels (value is measured against these): "
+                + ", ".join(f"{pos} {value:.1f}" for pos, value in snapshot.levels.items())
+                + " · waiver levels (fill empty slots only): "
+                + ", ".join(f"{pos} {value:.1f}" for pos, value in snapshot.drv.items())
             )
             with st.expander("Free agents behind the waiver levels"):
                 st.caption(
-                    "Each waiver level is the average of the best few healthy free agents at the position, "
-                    "discounted 10% because a waiver pickup isn't a sure thing week to week. "
-                    "PPG blends season average and projection; compare it with your Waiver Wire page."
+                    "Each waiver level is the average of the best few healthy free agents at the position. "
+                    "It only fills a lineup slot nobody on the roster can play (bye, injury, no player there); "
+                    "player value is measured against the league's last starter, not the waiver wire."
                 )
                 rows = [
                     {"Position": pos, "Free agent": name, "PPG used": round(blend, 1),
@@ -475,7 +485,7 @@ def main():
                     "injuries and matchups. A player only helps a lineup where he beats the waiver level."
                 )
                 st.dataframe(
-                    player_values_table(snapshot.teams[team_id], snapshot.drv), width="stretch", hide_index=True
+                    player_values_table(snapshot.teams[team_id], snapshot.levels), width="stretch", hide_index=True
                 )
 
             target_choice = st.selectbox("Target team", ["Scan every team"] + list(others))
