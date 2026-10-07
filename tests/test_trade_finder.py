@@ -443,3 +443,14 @@ def test_a_newcomer_taking_a_traded_players_slot_is_not_a_hole_filled():
     assert "WR" not in t.theirs.need_solved
     assert "nobody to play" not in t.them_why and "nobody to play" not in t.you_why
     assert "leaves" in explain(t)[1] or "over" in explain(t)[1]
+
+
+def test_same_position_displacement_is_matched_before_any_fallback():
+    # London (my flex) for Jacobs + Johnson: Johnson replaces my TE Loveland, Jacobs takes the flex London leaves
+    me = core("m", [P("London", "WR", 15.4), P("Loveland", "TE", 8.0), P("Thomas", "WR", 5)], te=8.0, wr=(14, 12))
+    me = [p for p in me if p.name != "mTE"]
+    target = core("t", [P("Jacobs", "RB", 12.4), P("Johnson", "TE", 11.7)], rb=(14, 12.4), wr=(12, 9.6))
+    target = [p for p in target if p.name != "tRB2"]
+    t = evaluate(snapshot(me, target), ["London"], ["Jacobs", "Johnson"])
+    pairs = {p.name: (d.name if d else None) for p, d, _ in t.mine.upgrades}
+    assert pairs["Johnson"] == "Loveland" and pairs["Jacobs"] == "London"

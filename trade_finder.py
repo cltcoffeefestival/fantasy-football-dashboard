@@ -658,19 +658,27 @@ class TradeContext:
             key=lambda p: p.base,
         )
         leaving = sorted((p for p in side.team.players if id(p) in side.starters and id(p) in out_ids), key=lambda p: p.base)
+        ordered = sorted(incoming_starters, key=lambda p: p.base, reverse=True)
+        matched: Dict[int, Optional[PlayerValue]] = {}
+        # same-position matches first (a TE replaces the benched TE), then anyone left takes what remains
+        for pool in (benched, leaving):
+            for same_position in (True, False):
+                for p in ordered:
+                    if id(p) in matched:
+                        continue
+                    d = next((d for d in pool if not same_position or d.position == p.position), None)
+                    if d is not None:
+                        pool.remove(d)
+                        matched[id(p)] = d
         upgrades = []
-        for p in sorted(incoming_starters, key=lambda p: p.base, reverse=True):
-            match = next((d for d in benched if d.position == p.position), None) or (benched[0] if benched else None)
-            if match is not None:
-                benched.remove(match)
-                upgrades.append((p, match, max(0.0, p.base - match.base)))
-                continue
-            vacated = next((d for d in leaving if d.position == p.position), None) or (leaving[0] if leaving else None)
-            if vacated is not None:
-                leaving.remove(vacated)
-                upgrades.append((p, vacated, p.base - vacated.base))
-            else:
+        for p in ordered:
+            d = matched.get(id(p))
+            if d is None:
                 upgrades.append((p, None, max(0.0, p.base - self.drv.get(p.position, 0.0))))
+            elif id(d) in out_ids:
+                upgrades.append((p, d, p.base - d.base))
+            else:
+                upgrades.append((p, d, max(0.0, p.base - d.base)))
         return upgrades
 
     def evaluate(self, send: List[PlayerValue], receive: List[PlayerValue]) -> TradeProposal:
