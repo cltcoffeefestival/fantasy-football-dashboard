@@ -513,3 +513,32 @@ def test_generated_proposals_always_give_the_target_a_reason():
     result = generate_trades(snapshot(me, target), 1, 2)
     for t in [x for ps in result.values() for x in ps] + result.near_misses:
         assert t.theirs.has_reason
+
+
+
+def test_a_fixed_slot_is_no_reason_when_their_lineup_does_not_improve():
+    # Waddle for McLaurin + Freiermuth: McLaurin is hurt, so their WR slot looked empty and Waddle
+    # "fixes" it, but they'd be trading McLaurin away and their lineup doesn't move
+    from trade_finder import SideImpact
+    fixed_nothing = SideImpact(lineup_delta=-0.02, need_solved=["WR"], value_delta=-2.6)
+    fixed_something = SideImpact(lineup_delta=0.6, need_solved=["WR"], value_delta=-2.6)
+    assert not fixed_nothing.has_reason
+    assert fixed_something.has_reason
+
+
+def test_a_trade_that_does_not_move_my_lineup_is_not_proposed():
+    # value edge for me, no starting-points gain: not worth sending
+    me = core("m", [P("mWR3", "WR", 11.4)], wr=(14, 12))
+    target = core("t", [P("tRB3", "RB", 11.7), P("tRB4", "RB", 13)], rb=(15, 14), wr=(15, 6))
+    t = evaluate(snapshot(me, target), ["mWR3"], ["tRB3"])
+    assert t.theirs.has_reason and t.my_effective_gain > 0.3     # fine for them, a paper gain for me
+    assert t.mine.lineup_delta < 0.5
+    assert t.tier is None and "barely moves" in why_no_tier(t)
+
+
+def test_generated_proposals_always_move_my_lineup():
+    me = core("m", [P("mWR3", "WR", 13), P("mRB3", "RB", 14), P("mRB4", "RB", 12.5)], wr=(14, 9))
+    target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tRB3", "RB", 12)], rb=(15, 8))
+    result = generate_trades(snapshot(me, target), 1, 2)
+    for t in [x for ps in result.values() for x in ps]:
+        assert t.mine.lineup_delta >= 0.5

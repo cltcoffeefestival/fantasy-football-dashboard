@@ -90,6 +90,9 @@ WEAKNESS_RATE = 0.5
 # manager something concrete: a real lineup gain, a weak or empty slot fixed, or more value than he
 # gives up. "Two of my players for one of yours that's no better" offers none of these.
 REASON_MIN_GAIN = 1.0
+# ...and the engine's job is to improve YOUR lineup: a proposal that only shuffles value around
+# without moving your starting points this much isn't worth sending.
+MY_MIN_LINEUP = 0.5
 FREED_SPOT_BONUS = 0.5       # per roster spot the target frees (consolidation is welcome)
 NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}   # the league's star tier, for explanations
@@ -198,7 +201,13 @@ class SideImpact:
     @property
     def has_reason(self) -> bool:
         """A concrete reason to say yes: a real lineup gain, a fixed weak spot, or value gained"""
-        return self.lineup_delta >= REASON_MIN_GAIN or bool(self.need_solved) or self.value_delta >= 0
+        # a fixed slot only counts if the lineup actually gets better (giving away the injured
+        # starter who'd fill it later fixes nothing)
+        return (
+            self.lineup_delta >= REASON_MIN_GAIN
+            or (bool(self.need_solved) and self.lineup_delta > 0)
+            or self.value_delta >= 0
+        )
 
     @property
     def friction(self) -> float:
@@ -770,6 +779,8 @@ class TradeContext:
     def _assign_tier(self, t: TradeProposal) -> Optional[str]:
         if t.blocked or t.my_effective_gain <= 0 or not t.theirs.has_reason:
             return None
+        if t.mine.lineup_delta < MY_MIN_LINEUP:
+            return None
         accept, mine = t.acceptance, t.my_effective_gain
         if accept >= WIN_WIN[1] and mine >= WIN_WIN[2] and t.simple:
             return WIN_WIN[0]
@@ -892,6 +903,11 @@ def why_no_tier(t: TradeProposal) -> str:
             f"Nothing in it for them: their lineup moves only {t.theirs.lineup_delta:+.1f}, it fixes no weak spot, "
             f"and they give up more value than they get ({VALUE_WEIGHT * t.theirs.value_delta:+.1f})."
         )
+    if t.mine.lineup_delta < MY_MIN_LINEUP:
+        return (
+            f"Your starting lineup barely moves ({t.mine.lineup_delta:+.1f} PPG, needs {MY_MIN_LINEUP:+.1f}); "
+            f"the {t.my_effective_gain:+.1f} is mostly paper value, not points on the field."
+        )
     accept, mine = t.acceptance, t.my_effective_gain
     if accept < LONG_SHOT[1]:
         return f"Their acceptance score is {accept:+.1f}, below the {LONG_SHOT[1]:+.1f} floor for even a Long Shot: {t.fails_because}."
@@ -938,6 +954,7 @@ FUNNEL_LABELS = {
     "checked": "possible trades checked",
     "blocked": "blocked (a starter for nothing they'd start)",
     "no_reason_for_them": "give them no concrete reason to say yes",
+    "no_lineup_gain": "barely move your starting lineup",
     "no_gain_for_you": "don't improve your team",
     "below_floor": "far too hard for them to accept",
     "stretch_for_them": "a stretch for them and not big enough for you to be worth it",
@@ -955,6 +972,8 @@ def _funnel_reason(t: TradeProposal) -> str:
         return "no_gain_for_you"
     if not t.theirs.has_reason:
         return "no_reason_for_them"
+    if t.mine.lineup_delta < MY_MIN_LINEUP:
+        return "no_lineup_gain"
     if t.acceptance < LONG_SHOT[1]:
         return "below_floor"
     if t.acceptance < WORTH_A_SHOT[1]:
@@ -1080,7 +1099,8 @@ def _upgrade_text(side: SideImpact) -> str:
     out_ids = {id(p) for p in side.outgoing}
     for p, displaced, gain in side.upgrades:
         if displaced is not None and id(displaced) in out_ids:
-            parts.append(f"{p.name} ({p.base:.1f} PPG) takes the {p.position} spot {displaced.name} ({displaced.base:.1f}) leaves, {gain:+.1f} PPG")
+            spot = f"{p.position} spot" if p.position == displaced.position else "flex spot"
+            parts.append(f"{p.name} ({p.base:.1f} PPG) takes the {spot} {displaced.name} ({displaced.base:.1f}) leaves, {gain:+.1f} PPG")
             continue
         if displaced is not None and displaced.base > p.base:
             parts.append(f"{p.name} ({p.base:.1f} PPG) shares {p.position} starts with {displaced.name} ({displaced.base:.1f}) depending on the week")
