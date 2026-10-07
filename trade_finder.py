@@ -168,6 +168,7 @@ class SideImpact:
     lost_starters: List[PlayerValue] = field(default_factory=list)
     redundant: List[PlayerValue] = field(default_factory=list)   # incoming players who would rarely start
     best_out: Optional[PlayerValue] = None               # the most valuable player the side gives up
+    best_out_share: float = 0.0                          # how often that player started for the side before
     best_in: Optional[PlayerValue] = None
     after_roster: List[PlayerValue] = field(default_factory=list)   # lineup-eligible roster after the trade
     lineup_before: List[Tuple[str, str, float]] = field(default_factory=list)
@@ -578,10 +579,15 @@ class TradeContext:
         shares = start_shares(roster, self.ctx, self.n)
         lineup_delta = after - side.before
 
-        # asset value: what comes in is discounted by how often it would start; what goes out is
-        # felt in full (a target even overvalues it)
+        # asset value: what comes in is discounted by how often it would start. For the target, what
+        # goes out is discounted the same way (a backup QB he never starts is not his star) and then
+        # overvalued a little (endowment). For you, what goes out counts in full: a spare elite player
+        # is a trade chip, and the engine's job is to stop you selling him low.
         value_in = sum(asset_value(p, self.levels) * self.usefulness(p, shares.get(id(p), 0.0)) for p in incoming)
-        value_out = sum(asset_value(p, self.levels) for p in outgoing) + sum(asset_value(p, self.levels) for p in drops)
+        value_out = sum(
+            asset_value(p, self.levels) * (self.usefulness(p, side.shares.get(id(p), 0.0)) if is_target else 1.0)
+            for p in outgoing
+        ) + sum(asset_value(p, self.levels) for p in drops)
         value_delta = value_in - (ENDOWMENT if is_target else 1.0) * value_out
 
         incoming_starters = [p for p in incoming if shares.get(id(p), 0.0) >= 0.5]
@@ -625,6 +631,7 @@ class TradeContext:
             lost_starters=lost,
             redundant=redundant,
             best_out=max(outgoing, key=lambda p: asset_value(p, self.levels), default=None),
+            best_out_share=max((side.shares.get(id(p), 0.0) for p in outgoing), default=0.0),
             best_in=max(incoming, key=lambda p: asset_value(p, self.levels), default=None),
             after_roster=roster,
             slot_notes=slot_notes,
@@ -737,7 +744,9 @@ def headline_reasons(t: TradeProposal) -> Tuple[str, str]:
         fails.append("they'd get nothing they would start")
     if th.lineup_delta < 0:
         fails.append(f"their lineup drops {th.lineup_delta:+.1f} PPG")
-    if th.value_delta < 0 and th.best_out is not None:
+    if th.value_delta < 0 and th.best_out is not None and th.best_out_share < 0.5:
+        fails.append(f"they give up {th.best_out.name}, even if he was riding their bench")
+    elif th.value_delta < 0 and th.best_out is not None:
         fails.append(f"they give up the best player in the deal ({th.best_out.name})"
                      if th.best_in is None or asset_value_cmp(th) else f"they lose value ({VALUE_WEIGHT * th.value_delta:+.1f})")
     if th.hassle:
@@ -1026,7 +1035,8 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
     if t.theirs.value_delta >= 0:
         them.append(f"they come out ahead on value ({VALUE_WEIGHT * t.theirs.value_delta:+.1f})")
     elif t.theirs.best_out is not None:
-        them.append(f"they give up the best player in the deal ({t.theirs.best_out.name}), value {VALUE_WEIGHT * t.theirs.value_delta:+.1f}")
+        role = "their backup " if t.theirs.best_out_share < 0.5 else "the best player in the deal, "
+        them.append(f"they give up {role}{t.theirs.best_out.name}, value {VALUE_WEIGHT * t.theirs.value_delta:+.1f}")
     if t.theirs.hassle:
         them.append(f"package hassle −{t.theirs.hassle:.1f}")
     if t.theirs.lateral:
