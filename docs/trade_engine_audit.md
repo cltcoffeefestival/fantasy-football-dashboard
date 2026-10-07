@@ -70,7 +70,8 @@ Three currencies, each charged once per side:
 your gain  = LINEUP(you) + 0.5 × VALUE(you) − weak spot(you)
 acceptance = LINEUP(them) + 0.5 × VALUE(them) − friction + freed − weak spot(them)
 Win-Win: acceptance ≥ 1.5, you ≥ 1.5, 1-for-1    Worth a Shot: ≥ 0.5, you ≥ min gain
-Long Shot: −3.0 ≤ acceptance < 0.5, you ≥ 2.0    blocked: gives up a starter for nothing it would start
+Long Shot: −3.0 ≤ acceptance < 0.5, you ≥ 2.0
+every tier: the target needs a concrete reason — lineup +1.0, a weak/empty slot fixed, or value gained    blocked: gives up a starter for nothing it would start
 ```
 
 What this subsumes: TAP, TFL and sell-low (convex asset value + endowment); PLT and the lineup

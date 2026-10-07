@@ -86,6 +86,10 @@ LATERAL_MIN_GAIN = 2.5
 # position sinks further (relative to the league average) is charged this much on top of the lineup
 # change. Applies to both sides; only deepening an existing weakness counts, not trimming a strength.
 WEAKNESS_RATE = 0.5
+# ---- a reason to say yes. Friction can make a deal awkward, but every proposal has to give the other
+# manager something concrete: a real lineup gain, a weak or empty slot fixed, or more value than he
+# gives up. "Two of my players for one of yours that's no better" offers none of these.
+REASON_MIN_GAIN = 1.0
 FREED_SPOT_BONUS = 0.5       # per roster spot the target frees (consolidation is welcome)
 NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}   # the league's star tier, for explanations
@@ -190,6 +194,11 @@ class SideImpact:
     @property
     def delta(self) -> float:
         return self.lineup_delta
+
+    @property
+    def has_reason(self) -> bool:
+        """A concrete reason to say yes: a real lineup gain, a fixed weak spot, or value gained"""
+        return self.lineup_delta >= REASON_MIN_GAIN or bool(self.need_solved) or self.value_delta >= 0
 
     @property
     def friction(self) -> float:
@@ -674,7 +683,10 @@ class TradeContext:
             freed=FREED_SPOT_BONUS * max(0, len(outgoing) - len(incoming)) if is_target else 0.0,
             weakness=weakness,
             weakened=weakened,
-            shape=trade_shape(len(outgoing), len(incoming), incoming_starters, redundant, lineup_delta),
+            shape=trade_shape(
+                len(outgoing), len(incoming), incoming_starters, redundant, lineup_delta,
+                upgrade_in_quality=max((p.base for p in incoming), default=0.0) > max((p.base for p in outgoing), default=0.0),
+            ),
             upgrades=upgrades,
             start_share=shares,
             drops=drops,
@@ -756,7 +768,7 @@ class TradeContext:
             impact.lineup_after = lineup_rows(impact.after_roster, slots, self.ctx, self.n)
 
     def _assign_tier(self, t: TradeProposal) -> Optional[str]:
-        if t.blocked or t.my_effective_gain <= 0:
+        if t.blocked or t.my_effective_gain <= 0 or not t.theirs.has_reason:
             return None
         accept, mine = t.acceptance, t.my_effective_gain
         if accept >= WIN_WIN[1] and mine >= WIN_WIN[2] and t.simple:
@@ -768,11 +780,15 @@ class TradeContext:
         return None
 
 
-def trade_shape(gives: int, gets: int, incoming_starters, redundant, lineup_delta: float) -> str:
+def trade_shape(gives: int, gets: int, incoming_starters, redundant, lineup_delta: float,
+                upgrade_in_quality: bool = True) -> str:
     """The roster archetype of a side's end of the deal"""
     starts = len(incoming_starters)
     if gets < gives:
-        return "consolidation" if starts else "roster clearing"
+        if not starts:
+            return "roster clearing"
+        # consolidating means getting one player BETTER than any you give; otherwise it's a giveaway
+        return "consolidation" if upgrade_in_quality else "two for a lesser one"
     if gets > gives:
         if starts >= 2:
             return "diversification"
@@ -811,6 +827,8 @@ def headline_reasons(t: TradeProposal) -> Tuple[str, str]:
     fails = []
     if th.blocked:
         fails.append("they'd get nothing they would start")
+    if th.shape == "two for a lesser one":
+        fails.append(f"they'd give two players for one who's no better than {th.best_out.name}")
     if th.lineup_delta < 0:
         fails.append(f"their lineup drops {th.lineup_delta:+.1f} PPG")
     if th.value_delta < 0 and th.best_out is not None and th.best_out_share < 0.5:
@@ -869,6 +887,11 @@ def why_no_tier(t: TradeProposal) -> str:
                 f"{weakened_text(t.mine)} (−{t.mine.weakness:.1f}); net {t.my_effective_gain:+.1f} for you."
             )
         return f"It doesn't improve your team ({t.my_effective_gain:+.1f} for you)."
+    if not t.theirs.has_reason:
+        return (
+            f"Nothing in it for them: their lineup moves only {t.theirs.lineup_delta:+.1f}, it fixes no weak spot, "
+            f"and they give up more value than they get ({VALUE_WEIGHT * t.theirs.value_delta:+.1f})."
+        )
     accept, mine = t.acceptance, t.my_effective_gain
     if accept < LONG_SHOT[1]:
         return f"Their acceptance score is {accept:+.1f}, below the {LONG_SHOT[1]:+.1f} floor for even a Long Shot: {t.fails_because}."
@@ -914,6 +937,7 @@ class TradeResults(dict):
 FUNNEL_LABELS = {
     "checked": "possible trades checked",
     "blocked": "blocked (a starter for nothing they'd start)",
+    "no_reason_for_them": "give them no concrete reason to say yes",
     "no_gain_for_you": "don't improve your team",
     "below_floor": "far too hard for them to accept",
     "stretch_for_them": "a stretch for them and not big enough for you to be worth it",
@@ -929,6 +953,8 @@ def _funnel_reason(t: TradeProposal) -> str:
         return "blocked"
     if t.my_effective_gain <= 0:
         return "no_gain_for_you"
+    if not t.theirs.has_reason:
+        return "no_reason_for_them"
     if t.acceptance < LONG_SHOT[1]:
         return "below_floor"
     if t.acceptance < WORTH_A_SHOT[1]:
@@ -1055,6 +1081,9 @@ def _upgrade_text(side: SideImpact) -> str:
     for p, displaced, gain in side.upgrades:
         if displaced is not None and id(displaced) in out_ids:
             parts.append(f"{p.name} ({p.base:.1f} PPG) takes the {p.position} spot {displaced.name} ({displaced.base:.1f}) leaves, {gain:+.1f} PPG")
+            continue
+        if displaced is not None and displaced.base > p.base:
+            parts.append(f"{p.name} ({p.base:.1f} PPG) shares {p.position} starts with {displaced.name} ({displaced.base:.1f}) depending on the week")
             continue
         over = (
             f"over {displaced.name} ({displaced.base:.1f})"

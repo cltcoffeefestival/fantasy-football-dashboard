@@ -484,3 +484,32 @@ def test_the_target_feels_its_own_weak_spot_too():
     assert [w[0] for w in t.theirs.weakened] == ["WR"] and t.theirs.weakness > 0
     assert "already-weak WR" in t.fails_because or "weak WR" in t.fails_because
     assert any(label == "Weak spot thinned" for label, _ in breakdown(t.theirs, True))
+
+
+
+# ---- every proposal needs a reason for them (Judkins for Love + Monangai, Warren for Wilson + Montgomery)
+
+def test_two_for_one_lesser_player_is_never_proposed():
+    me = core("m", [P("Judkins", "RB", 13.9)], rb=(9, 7), wr=(14, 9.7))
+    target = core("t", [P("Love", "RB", 14.0), P("Monangai", "RB", 12.0)], rb=(15.8, 14.0))
+    target = [p for p in target if p.name != "tRB2"]
+    t = evaluate(snapshot(me, target), ["Judkins"], ["Love", "Monangai"])
+    assert t.theirs.shape == "two for a lesser one"
+    assert not t.theirs.has_reason and t.tier is None
+    assert "Nothing in it for them" in why_no_tier(t)
+    assert "consolidate" not in t.works_because
+
+
+def test_a_real_consolidation_still_qualifies():
+    me = core("m", [P("Star", "WR", 22)], wr=(14, 12))
+    target = core("t", [P("tRB3", "RB", 14), P("tRB4", "RB", 13)], wr=(13, 11))
+    t = evaluate(snapshot(me, target), ["Star"], ["tRB3", "tRB4"])
+    assert t.theirs.shape == "consolidation" and t.theirs.has_reason
+
+
+def test_generated_proposals_always_give_the_target_a_reason():
+    me = core("m", [P("mWR3", "WR", 13), P("mRB3", "RB", 14), P("mRB4", "RB", 12.5)], wr=(14, 9))
+    target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tRB3", "RB", 12)], rb=(15, 8))
+    result = generate_trades(snapshot(me, target), 1, 2)
+    for t in [x for ps in result.values() for x in ps] + result.near_misses:
+        assert t.theirs.has_reason
