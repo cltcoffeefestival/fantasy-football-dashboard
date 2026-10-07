@@ -81,6 +81,11 @@ HASSLE = {2: 0.0, 3: 1.5, 4: 2.5}
 # A same-position swap has to be clearly better to be worth the target's bother; a sideways move
 # ("my RB for your slightly better RB") is the trade nobody makes.
 LATERAL_MIN_GAIN = 2.5
+# ---- balance. A trade can add up to a gain while leaving a position that was already below the
+# league average even thinner: no depth there, one injury from a hole. Each PPG a below-average
+# position sinks further (relative to the league average) is charged this much on top of the lineup
+# change. Applies to both sides; only deepening an existing weakness counts, not trimming a strength.
+WEAKNESS_RATE = 0.5
 FREED_SPOT_BONUS = 0.5       # per roster spot the target frees (consolidation is welcome)
 NON_TRADE_POSITIONS = {"K", "D/ST"}   # nobody trades for these; keep them out of the candidate pools
 S_TIER_TOP = {"QB": 3, "RB": 5, "WR": 6, "TE": 3}   # the league's star tier, for explanations
@@ -160,6 +165,9 @@ class SideImpact:
     hassle: float = 0.0                                  # package friction (target only)
     lateral: float = 0.0                                 # sideways-swap friction (target only)
     freed: float = 0.0                                   # roster-spot bonus (target only)
+    weakness: float = 0.0                                # charge for deepening a below-average position
+    # (position, PPG before, PPG after, league average) for each position the trade weakens further
+    weakened: List[Tuple[str, float, float, float]] = field(default_factory=list)
     shape: str = ""                                      # consolidation / diversification / depth / upgrade / ...
     # (incoming starter, starter he displaces or None for an empty slot, PPG gained at the slot)
     upgrades: List[Tuple[PlayerValue, Optional[PlayerValue], float]] = field(default_factory=list)
@@ -189,7 +197,7 @@ class SideImpact:
 
     @property
     def total(self) -> float:
-        return self.lineup_delta + VALUE_WEIGHT * self.value_delta - self.friction + self.freed
+        return self.lineup_delta + VALUE_WEIGHT * self.value_delta - self.friction + self.freed - self.weakness
 
 
 @dataclass
@@ -412,6 +420,21 @@ def lineup_ppg(players: List[PlayerValue], ctx, n_weeks: int) -> float:
     return sum(_solve_week(players, ctx, w)[0] for w in range(n_weeks)) / n_weeks
 
 
+def position_ppg(players: List[PlayerValue], dedicated: Dict[str, int], drv: Dict[str, float], n_weeks: int) -> Dict[str, float]:
+    """Strength at each position: weekly points of the best players available for its dedicated
+    slots (2 RB, 2 WR, 1 TE...), averaged over the window. An empty slot counts at the waiver level.
+    Flex is left out so a position doesn't look stronger or weaker just because of who gets the flex."""
+    out = {}
+    for pos, k in dedicated.items():
+        total = 0.0
+        for w in range(n_weeks):
+            pts = sorted((p.weekly[w] for p in players if p.position == pos and _available(p, w)), reverse=True)[:k]
+            pts += [drv.get(pos, 0.0)] * (k - len(pts))
+            total += sum(max(x, 0.0) for x in pts)
+        out[pos] = total / n_weeks
+    return out
+
+
 def start_counts(players: List[PlayerValue], ctx, n_weeks: int) -> Dict[int, int]:
     """How many weeks of the window each player is in the optimal lineup"""
     counts: Dict[int, int] = {}
@@ -537,6 +560,7 @@ class Side:
     def __init__(self, team: TeamSnapshot, tc: "TradeContext"):
         self.team = team
         self.before = lineup_ppg(team.players, tc.ctx, tc.n)
+        self.pos_before = position_ppg(team.players, tc.dedicated, tc.drv, tc.n)
         self.shares = start_shares(team.players, tc.ctx, tc.n)
         self.starters = {pid for pid, s in self.shares.items() if s >= 0.5}
         # cheapest to cut first: bench before starters, then lowest asset value
@@ -558,6 +582,17 @@ class TradeContext:
         self.ctx = slot_context(snapshot.slots, snapshot.drv)
         self.s_tier = s_tier_ids(snapshot)
         self.single = single_slot_positions(snapshot.slots)
+        # dedicated starting slots per position (flex left out), and the league average strength there
+        self.dedicated: Dict[str, int] = {}
+        for _, eligible in snapshot.slots:
+            if len(eligible) == 1:
+                pos = next(iter(eligible))
+                if pos not in NON_TRADE_POSITIONS:
+                    self.dedicated[pos] = self.dedicated.get(pos, 0) + 1
+        by_team = [position_ppg(t.players, self.dedicated, self.drv, self.n) for t in snapshot.teams.values()] if self.n else []
+        self.league_pos = {
+            pos: sum(b[pos] for b in by_team) / len(by_team) for pos in self.dedicated
+        } if by_team else {}
         self.mine = Side(snapshot.teams[my_id], self)
         self.theirs = Side(snapshot.teams[target_id], self)
 
@@ -579,6 +614,16 @@ class TradeContext:
         after = lineup_ppg(roster, self.ctx, self.n)
         shares = start_shares(roster, self.ctx, self.n)
         lineup_delta = after - side.before
+
+        # balance: a position already below the league average that the trade pushes further below
+        pos_after = position_ppg(roster, self.dedicated, self.drv, self.n)
+        weakened = []
+        for pos, avg in self.league_pos.items():
+            before_pos, after_pos = side.pos_before.get(pos, 0.0), pos_after.get(pos, 0.0)
+            deeper = max(0.0, avg - after_pos) - max(0.0, avg - before_pos)
+            if deeper > 0.05:
+                weakened.append((pos, before_pos, after_pos, avg))
+        weakness = WEAKNESS_RATE * sum(max(0.0, avg - a) - max(0.0, avg - b) for _, b, a, avg in weakened)
 
         # asset value: what comes in is discounted by how often it would start. For the target, what
         # goes out is discounted the same way (a backup QB he never starts is not his star) and then
@@ -627,6 +672,8 @@ class TradeContext:
             hassle=hassle(n_total) if is_target else 0.0,
             lateral=lateral,
             freed=FREED_SPOT_BONUS * max(0, len(outgoing) - len(incoming)) if is_target else 0.0,
+            weakness=weakness,
+            weakened=weakened,
             shape=trade_shape(len(outgoing), len(incoming), incoming_starters, redundant, lineup_delta),
             upgrades=upgrades,
             start_share=shares,
@@ -777,7 +824,13 @@ def headline_reasons(t: TradeProposal) -> Tuple[str, str]:
         fails.append("it's a sideways same-position swap that barely moves their lineup")
     if th.redundant:
         fails.append(f"{' + '.join(p.name for p in th.redundant)} would sit on their bench")
+    if th.weakened:
+        fails.append(f"it thins their already-weak {weakened_text(th)}")
     return ("; ".join(works) or "it doesn't help them", "; ".join(fails) or "nothing obvious")
+
+
+def weakened_text(side: SideImpact) -> str:
+    return ", ".join(f"{pos} ({b:.1f} → {a:.1f} vs league {avg:.1f})" for pos, b, a, avg in side.weakened)
 
 
 def asset_value_cmp(side: SideImpact) -> bool:
@@ -809,6 +862,11 @@ def why_no_tier(t: TradeProposal) -> str:
                 f"Your lineup changes {t.mine.lineup_delta:+.1f}, and you'd be giving away more value than you get "
                 f"({t.mine.best_out.name} is the best player in the deal, value {VALUE_WEIGHT * t.mine.value_delta:+.1f}); "
                 f"net {t.my_effective_gain:+.1f} for you."
+            )
+        if t.mine.weakened and t.mine.lineup_delta > 0:
+            return (
+                f"Your lineup improves ({t.mine.lineup_delta:+.1f}), but it thins your already-weak "
+                f"{weakened_text(t.mine)} (−{t.mine.weakness:.1f}); net {t.my_effective_gain:+.1f} for you."
             )
         return f"It doesn't improve your team ({t.my_effective_gain:+.1f} for you)."
     accept, mine = t.acceptance, t.my_effective_gain
@@ -1025,6 +1083,8 @@ def breakdown(side: SideImpact, is_target: bool) -> List[Tuple[str, str]]:
         rows.append(("Redundant", _names(side.redundant)))
     if side.drops:
         rows.append(("Would cut", _names(side.drops)))
+    if side.weakened:
+        rows.append(("Weak spot thinned", f"{weakened_text(side)} → −{side.weakness:.1f}"))
     if is_target and (side.hassle or side.freed):
         rows.append(("Package", f"hassle −{side.hassle:.1f}" + (f", frees a roster spot +{side.freed:.1f}" if side.freed else "")))
     if is_target and side.lateral:
@@ -1052,6 +1112,8 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         you.append(f"note: {_names(t.mine.redundant)} would mostly sit on your bench")
     if t.mine.drops:
         you.append(f"you'd cut {_names(t.mine.drops)} to make room")
+    if t.mine.weakened:
+        you.append(f"caution: it thins your already-weak {weakened_text(t.mine)} (−{t.mine.weakness:.1f})")
 
     them = []
     if t.theirs.upgrades:
@@ -1070,6 +1132,8 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         them.append(f"sideways swap −{t.theirs.lateral:.1f}")
     if t.theirs.redundant:
         them.append(f"{_names(t.theirs.redundant)} would sit on their bench")
+    if t.theirs.weakened:
+        them.append(f"it thins their already-weak {weakened_text(t.theirs)} (−{t.theirs.weakness:.1f})")
     pitch = []
     for p in t.alpha_assets:
         if p.injured:

@@ -454,3 +454,33 @@ def test_same_position_displacement_is_matched_before_any_fallback():
     t = evaluate(snapshot(me, target), ["London"], ["Jacobs", "Johnson"])
     pairs = {p.name: (d.name if d else None) for p, d, _ in t.mine.upgrades}
     assert pairs["Johnson"] == "Loveland" and pairs["Jacobs"] == "London"
+
+
+# ---- balance: don't fix one position by thinning one that's already weak
+
+def test_upgrading_one_position_by_thinning_an_already_weak_one_is_charged():
+    # I'm thin at WR (13/9). Sending WR2 for a TE upgrade nets out positive on the lineup alone,
+    # but leaves my WR room even further below the league
+    me = core("m", [P("mWR3", "WR", 6)], wr=(13, 10), te=6)
+    target = core("t", [P("BigTE", "TE", 12), P("tTE2", "TE", 7)], te=9)
+    t = evaluate(snapshot(me, target), ["mWR2"], ["BigTE"])
+    assert t.mine.lineup_delta > 0
+    assert [w[0] for w in t.mine.weakened] == ["WR"] and t.mine.weakness > 0
+    assert t.my_effective_gain < t.mine.lineup_delta + VALUE_WEIGHT * t.mine.value_delta
+    assert "already-weak WR" in explain(t)[0]
+
+
+def test_the_same_trade_from_a_deep_wr_room_is_not_charged():
+    me = core("m", [P("mWR3", "WR", 13.5)], wr=(16, 14), te=6)
+    target = core("t", [P("BigTE", "TE", 12), P("tTE2", "TE", 7)], te=9)
+    t = evaluate(snapshot(me, target), ["mWR2"], ["BigTE"])
+    assert t.mine.weakness == 0.0 and not t.mine.weakened
+
+
+def test_the_target_feels_its_own_weak_spot_too():
+    me = core("m", [P("mRB3", "RB", 15), P("mRB4", "RB", 14)], rb=(16, 15), wr=(13, 11))
+    target = [p for p in core("t", [P("Star", "WR", 20)], rb=(12, 6), wr=(20, 14)) if p.name != "tWR1"]
+    t = evaluate(snapshot(me, target), ["mRB3", "mRB4"], ["Star"])
+    assert [w[0] for w in t.theirs.weakened] == ["WR"] and t.theirs.weakness > 0
+    assert "already-weak WR" in t.fails_because or "weak WR" in t.fails_because
+    assert any(label == "Weak spot thinned" for label, _ in breakdown(t.theirs, True))

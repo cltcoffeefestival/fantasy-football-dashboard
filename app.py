@@ -122,9 +122,11 @@ def render_proposal(t, why_label=None):
         st.markdown(
             "**Impact Breakdown**\n"
             f"- **You:** lineup **{t.my_gain:+.1f} PPG** · value {t.mine.value_delta * 0.5:+.1f} · "
-            f"worth **{t.my_effective_gain:+.1f}** to you · positions fixed: {fixed} · displaced: {displaced}\n"
+            + (f"weak spot −{t.mine.weakness:.1f} · " if t.mine.weakness else "")
+            + f"worth **{t.my_effective_gain:+.1f}** to you · positions fixed: {fixed} · displaced: {displaced}\n"
             f"- **{md_escape(t.target_name.strip())}:** lineup {t.delta_lineup:+.1f} PPG · value {t.theirs.value_delta * 0.5:+.1f}"
             + (f" · hassle −{t.theirs.hassle:.1f}" if t.theirs.hassle else "")
+            + (f" · weak spot −{t.theirs.weakness:.1f}" if t.theirs.weakness else "")
             + f" · acceptance **{t.acceptance:+.1f}**\n"
             f"- **Mutual:** {t.nmu:+.1f} · confidence: {t.confidence}\n"
             f"- **Works because:** {md_escape(t.works_because)}\n"
