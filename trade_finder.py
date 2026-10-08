@@ -166,6 +166,8 @@ class SideImpact:
     start_share: Dict[int, float] = field(default_factory=dict)   # id(player) -> share of weeks he starts (after)
     drops: List[PlayerValue] = field(default_factory=list)       # bench players cut to make room
     lost_starters: List[PlayerValue] = field(default_factory=list)
+    # outgoing players who started some weeks but under half: (player, share of weeks he started before)
+    part_starters: List[Tuple[PlayerValue, float]] = field(default_factory=list)
     redundant: List[PlayerValue] = field(default_factory=list)   # incoming players who would rarely start
     best_out: Optional[PlayerValue] = None               # the most valuable player the side gives up
     best_in: Optional[PlayerValue] = None
@@ -586,6 +588,7 @@ class TradeContext:
 
         incoming_starters = [p for p in incoming if shares.get(id(p), 0.0) >= 0.5]
         lost = [p for p in outgoing if id(p) in side.starters]
+        part = [(p, side.shares[id(p)]) for p in outgoing if 0 < side.shares.get(id(p), 0.0) < 0.5]
         redundant = [p for p in incoming if shares.get(id(p), 0.0) < 0.25]
         upgrades = self._upgrades(side, incoming_starters, out_ids, shares)
 
@@ -623,6 +626,7 @@ class TradeContext:
             start_share=shares,
             drops=drops,
             lost_starters=lost,
+            part_starters=part,
             redundant=redundant,
             best_out=max(outgoing, key=lambda p: asset_value(p, self.levels), default=None),
             best_in=max(incoming, key=lambda p: asset_value(p, self.levels), default=None),
@@ -644,11 +648,12 @@ class TradeContext:
         upgrades = []
         for p in sorted(incoming_starters, key=lambda p: p.base, reverse=True):
             match = next((d for d in pool if d.position == p.position), None) or (pool[0] if pool else None)
+            # the gain is shown next to the two PPGs, so it is the difference of the rounded figures
             if match is not None:
                 pool.remove(match)
-                gain = max(0.0, p.base - match.base)
+                gain = max(0.0, round(p.base, 1) - round(match.base, 1))
             else:
-                gain = max(0.0, p.base - self.drv.get(p.position, 0.0))
+                gain = max(0.0, round(p.base, 1) - round(self.drv.get(p.position, 0.0), 1))
             upgrades.append((p, match, gain))
         return upgrades
 
@@ -682,7 +687,8 @@ class TradeContext:
     def _assign_tier(self, t: TradeProposal) -> Optional[str]:
         if t.blocked or t.my_effective_gain <= 0:
             return None
-        accept, mine = t.acceptance, t.my_effective_gain
+        # compared as displayed (one decimal), so a trade shown as +1.5 / +1.5 is a Win-Win
+        accept, mine = round(t.acceptance, 1), round(t.my_effective_gain, 1)
         if accept >= WIN_WIN[1] and mine >= WIN_WIN[2] and t.simple:
             return WIN_WIN[0]
         if accept >= WORTH_A_SHOT[1] and mine >= self.min_gain:
@@ -741,7 +747,7 @@ def headline_reasons(t: TradeProposal) -> Tuple[str, str]:
         fails.append(f"they give up the best player in the deal ({th.best_out.name})"
                      if th.best_in is None or asset_value_cmp(th) else f"they lose value ({VALUE_WEIGHT * th.value_delta:+.1f})")
     if th.hassle:
-        fails.append(f"it's a {len(t.send) + len(t.receive)}-player deal, which owners here have rejected every time")
+        fails.append(f"a {len(t.send) + len(t.receive)}-player deal is a harder sell than a one-for-one; packages have been turned down in this league before")
     if th.lateral:
         fails.append("it's a sideways same-position swap that barely moves their lineup")
     if th.redundant:
@@ -908,29 +914,36 @@ def generate_trades(
                 funnel[reason] += 1
                 if reason in ("your_gain_too_small", "stretch_for_them") and t.my_effective_gain >= NEAR_MISS_MIN_GAIN:
                     misses.append(t)
-                if t.tier is None or (strict and t.acceptance < STRICT_MIN_ACCEPT):
+                if t.tier is None or (strict and round(t.acceptance, 1) < STRICT_MIN_ACCEPT):
                     continue
                 candidates[t.tier].append(t)
     result.funnel = funnel
 
-    def take(found, limit, into):
+    shown: List[Tuple[set, set]] = []     # (send ids, receive ids) of every proposal already listed in a tier
+
+    def take(found, limit, into, dedupe_across_tiers=False):
         found.sort(key=lambda t: (-t.nmu, -t.acceptance))
         used_send, used_recv = set(), set()
         for t in found:
             s_ids, r_ids = {id(p) for p in t.send}, {id(p) for p in t.receive}
             if s_ids & used_send or r_ids & used_recv:
                 continue
+            # a better tier already shows this deal; adding players to it is padding, not a new idea
+            if dedupe_across_tiers and any(s <= s_ids and r <= r_ids for s, r in shown):
+                continue
             t.you_why, t.them_why = explain(t)
             tc.attach_lineups(t)
             into.append(t)
             used_send |= s_ids
             used_recv |= r_ids
+            if dedupe_across_tiers:
+                shown.append((s_ids, r_ids))
             if len(into) >= limit:
                 break
 
     take(misses, NEAR_MISS_LIMIT, result.near_misses)
-    for tier, found in candidates.items():
-        take(found, per_tier, result[tier])
+    for tier, found in candidates.items():      # TIERS order: best tier first
+        take(found, per_tier, result[tier], dedupe_across_tiers=True)
     return result
 
 
@@ -963,11 +976,23 @@ def _upgrade_text(side: SideImpact) -> str:
     parts = []
     for p, displaced, gain in side.upgrades:
         over = (
-            f"over {displaced.name} ({displaced.base:.1f})"
+            f"over {displaced.name} ({displaced.base:.1f}{_bye_note(displaced)})"
             if displaced else f"in a slot where {side.slot_notes.get(id(p), 'a waiver pickup would otherwise play')}"
         )
-        parts.append(f"{p.name} ({p.base:.1f} PPG) starts at {p.position} {over}, +{gain:.1f} PPG")
+        parts.append(f"{p.name} ({p.base:.1f} PPG{_bye_note(p)}) starts at {p.position} {over}, +{gain:.1f} PPG")
     return "; ".join(parts)
+
+
+def _bye_note(p: PlayerValue) -> str:
+    """', bye in N of M weeks' when the player misses part of the window: that gap is often what a
+    swap of two equal players is really trading"""
+    byes = p.weekly.count(0.0) if p.weekly and not p.injured else 0
+    return f", bye in {byes} of {len(p.weekly)} weeks" if byes else ""
+
+
+def _part_starter_text(side: SideImpact) -> str:
+    """'X (2 of 4 starts)' for outgoing players who started some weeks but were not regular starters"""
+    return " + ".join(f"{p.name} ({round(share * len(p.weekly))} of {len(p.weekly)} starts)" for p, share in side.part_starters)
 
 
 PENALTY_LABELS = {"value lost": "value lost", "package hassle": "package hassle", "sideways swap": "sideways swap"}
@@ -1008,6 +1033,8 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         you.append(f"your lineup changes by {t.mine.lineup_delta:+.1f} PPG")
     if t.mine.lost_starters:
         you.append(f"you give up {_names(t.mine.lost_starters)} from your lineup")
+    if t.mine.part_starters:
+        you.append(f"you also lose {_part_starter_text(t.mine)}")
     if t.mine.value_delta < 0 and t.mine.best_out is not None:
         you.append(f"caution: {t.mine.best_out.name} is the best player in the deal, you net {VALUE_WEIGHT * t.mine.value_delta:+.1f} in value")
     elif t.mine.value_delta > 0:
@@ -1022,6 +1049,10 @@ def explain(t: TradeProposal) -> Tuple[str, str]:
         them.append(_upgrade_text(t.theirs))
     else:
         them.append(f"their lineup changes by {t.theirs.lineup_delta:+.1f} PPG")
+    if t.theirs.lost_starters:
+        them.append(f"they give up {_names(t.theirs.lost_starters)} from their lineup")
+    if t.theirs.part_starters:
+        them.append(f"they also lose {_part_starter_text(t.theirs)}")
     them.append(f"for them it's a {t.theirs.shape}")
     if t.theirs.value_delta >= 0:
         them.append(f"they come out ahead on value ({VALUE_WEIGHT * t.theirs.value_delta:+.1f})")
