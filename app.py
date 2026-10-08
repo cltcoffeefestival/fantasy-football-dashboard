@@ -122,11 +122,9 @@ def render_proposal(t, why_label=None):
         st.markdown(
             "**Impact Breakdown**\n"
             f"- **You:** lineup **{t.my_gain:+.1f} PPG** · value {t.mine.value_delta * 0.5:+.1f} · "
-            + (f"weak spot −{t.mine.weakness:.1f} · " if t.mine.weakness else "")
-            + f"worth **{t.my_effective_gain:+.1f}** to you · positions fixed: {fixed} · displaced: {displaced}\n"
-            f"- **{md_escape(t.target_name.strip())}:** lineup {t.delta_lineup:+.1f} PPG · value {t.theirs.value_delta * 0.5:+.1f}"
+            f"worth **{t.my_effective_gain:+.1f}** to you · positions fixed: {fixed} · displaced: {displaced}\n"
+            f"- **{md_escape(t.target_name)}:** lineup {t.delta_lineup:+.1f} PPG · value {t.theirs.value_delta * 0.5:+.1f}"
             + (f" · hassle −{t.theirs.hassle:.1f}" if t.theirs.hassle else "")
-            + (f" · weak spot −{t.theirs.weakness:.1f}" if t.theirs.weakness else "")
             + f" · acceptance **{t.acceptance:+.1f}**\n"
             f"- **Mutual:** {t.nmu:+.1f} · confidence: {t.confidence}\n"
             f"- **Works because:** {md_escape(t.works_because)}\n"
@@ -139,7 +137,7 @@ def render_proposal(t, why_label=None):
                 st.markdown("**You**")
                 st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.mine, False)], width="stretch", hide_index=True)
             with c2:
-                st.markdown(f"**{md_escape(t.target_name.strip())}**")
+                st.markdown(f"**{md_escape(t.target_name)}**")
                 st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.theirs, True)], width="stretch", hide_index=True)
         with st.expander("Lineup before → after"):
             lineup_table("You", t.mine)

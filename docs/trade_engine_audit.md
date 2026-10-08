@@ -64,14 +64,11 @@ Three currencies, each charged once per side:
 | **VALUE** | the asset a manager holds | `asset = v (1 + v/10) × availability`, `v = PPG − 0.75 × last-starter level`. Last-starter level = K-th best rostered PPG at the position, K = teams × (slots + flex share), floored at the waiver level. Convex so a star beats two mids. Incoming assets are discounted by how often the side would start them (bench weight 0.25 QB / 0.3 TE / 0.5 others in single-slot formats). The target overvalues what it gives up ×1.15 (endowment). |
 | **FRICTION** (target only) | hassle | 3-player deal 1.5, 4-player 2.5; +0.5 per roster spot freed; a sideways same-position swap must be worth 2.5 PPG or the shortfall is charged. |
 
-| **BALANCE** (both sides) | don't fix one spot by hollowing out a weak one | each position's strength = its dedicated starting slots (flex left out) over the window; if a trade leaves a position further below the league average than it was, 0.5 × the extra shortfall is charged. |
-
 ```
-your gain  = LINEUP(you) + 0.5 × VALUE(you) − weak spot(you)
-acceptance = LINEUP(them) + 0.5 × VALUE(them) − friction + freed − weak spot(them)
+your gain  = LINEUP(you) + 0.5 × VALUE(you)
+acceptance = LINEUP(them) + 0.5 × VALUE(them) − friction + freed
 Win-Win: acceptance ≥ 1.5, you ≥ 1.5, 1-for-1    Worth a Shot: ≥ 0.5, you ≥ min gain
-Long Shot: −3.0 ≤ acceptance < 0.5, you ≥ 2.0
-every tier: the target needs a concrete reason — lineup +1.0, a weak/empty slot fixed, or value gained    blocked: gives up a starter for nothing it would start
+Long Shot: −3.0 ≤ acceptance < 0.5, you ≥ 2.0    blocked: gives up a starter for nothing it would start
 ```
 
 What this subsumes: TAP, TFL and sell-low (convex asset value + endowment); PLT and the lineup
