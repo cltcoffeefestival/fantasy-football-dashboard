@@ -55,7 +55,7 @@ INJURY_AVAILABILITY = {
     "SUSPENSION": [0.0, 0.4, 0.8],
 }
 ASSET_HORIZON = 8            # weeks over which an injury discounts a player's season-long value
-AVAILABLE_FRACTION = 0.5     # a rostered player starts in a week he is expected to play at least this much
+AVAILABLE_FRACTION = 0.5     # a rostered player starts in a week he is at least this likely to play
 WAIVER_BEATS_BY = 3.0        # ...unless a waiver pickup would clearly outscore him by this much (then anyone streams)
 
 # Matchup: ESPN gives each opponent a rank vs. a position (1..32). We assume 1 is the toughest
@@ -77,7 +77,7 @@ BENCH_WEIGHT = {"QB": 0.25, "TE": 0.3}
 BENCH_WEIGHT_DEFAULT = 0.5
 # ---- friction (target only). Calibrated on real outcomes: every multi-player offer tried so far
 # was rejected (7 of 7) while the simple 1-for-1s were entertained.
-HASSLE = {2: 0.0, 3: 1.5, 4: 2.5}
+HASSLE = {1: 0.0, 2: 0.0, 3: 1.5, 4: 2.5}     # 1 = a player for nothing (custom trades only)
 # A same-position swap has to be clearly better to be worth the target's bother; a sideways move
 # ("my RB for your slightly better RB") is the trade nobody makes.
 LATERAL_MIN_GAIN = 2.5
@@ -356,8 +356,9 @@ def single_slot_positions(slots) -> set:
 
 
 def _available(p: PlayerValue, week: int) -> bool:
-    """A rostered player starts in a week he is expected to play; byes and injuries sit him"""
-    return p.weekly[week] > 0 and p.weekly[week] >= AVAILABLE_FRACTION * p.base
+    """A rostered player starts in a week he is expected to play; byes and injuries sit him. A low
+    projection alone (a hard matchup) does not: a manager still starts his healthy starter."""
+    return p.weekly[week] > 0 and availability(p.injury, week) >= AVAILABLE_FRACTION
 
 
 def _solve_week(players: List[PlayerValue], ctx, week: int):

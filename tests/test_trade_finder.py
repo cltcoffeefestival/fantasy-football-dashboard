@@ -487,3 +487,30 @@ def test_a_lower_tier_does_not_repeat_a_better_tier_deal_with_padding():
             assert not any(s0 <= s and r0 <= r for s0, r0 in listed), f"{tier}: {s} for {r} pads an earlier deal"
             listed.append((s, r))
     assert listed
+
+
+# ---- availability and the one-player deal
+
+def test_a_hard_matchup_does_not_bench_a_healthy_starter():
+    # a 16-PPG WR projected 7.5 one week still starts over the 9.5 waiver level: he is healthy
+    roster = core("m", wr=(16, 12))
+    roster = [P("mWR1", "WR", 16, weekly=[16, 7.5, 16, 16]) if p.name == "mWR1" else p for p in roster]
+    expected = (16 * 3 + 7.5) / 4 - 16
+    assert abs((weekly(roster) - weekly(core("m", wr=(16, 12)))) - expected) < 1e-9
+
+
+def test_a_doubtful_or_out_player_still_sits_and_a_questionable_one_plays():
+    base = core("m", wr=(16, 12))
+    out = [P("mWR1", "WR", 16, "OUT", weekly=[0, 4.8, 9.6, 13.6]) if p.name == "mWR1" else p for p in base]
+    doubtful = [P("mWR1", "WR", 16, "DOUBTFUL", weekly=[6.4, 12.8, 16, 16]) if p.name == "mWR1" else p for p in base]
+    questionable = [P("mWR1", "WR", 16, "QUESTIONABLE", weekly=[14.4, 16, 16, 16]) if p.name == "mWR1" else p for p in base]
+    waiver = FALLBACK_DRV["WR"]
+    # OUT: weeks 1-2 (0%, 30%) sit for the waiver level; weeks 3-4 (60%, 85%) play at the reduced projection
+    assert abs(weekly(out) - (weekly(base) - ((16 - waiver) * 2 + (16 - 9.6) + (16 - 13.6)) / 4)) < 1e-9
+    assert abs(weekly(doubtful) - (weekly(base) - (16 - waiver) / 4 - (16 - 12.8) / 4)) < 1e-9     # week 1 (0.4) sits, week 2 (0.8) plays
+    assert abs(weekly(questionable) - (weekly(base) - (16 - 14.4) / 4)) < 1e-9                       # plays every week
+
+
+def test_a_player_for_nothing_carries_no_package_hassle():
+    snap = snapshot(core("m", [P("a", "RB", 13)]), core("t", [P("x", "WR", 13)]))
+    assert evaluate(snap, ["a"], []).theirs.hassle == 0.0
