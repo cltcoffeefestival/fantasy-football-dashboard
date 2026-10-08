@@ -425,9 +425,12 @@ def main():
     elif page == "🔁 Trade Finder":
         st.header("🔁 Trade Finder")
         st.caption(
-            "A trade is only shown when it works for both managers. Your side: net starting-lineup gain. "
-            "Their side: Manager Acceptance Index, MAI = ΔLineup − TAP (Alpha tax) − BCP (bench clutter) "
-            "− TSP (trade structure) − PLT (lost starter) − AP (asymmetry) − lateral-swap tax. Net Mutual Utility = your gain + their MAI."
+            "A trade is only shown when it works for both managers. Each side is scored in PPG: the change to its "
+            "best starting lineup over the window, plus half the asset value it nets (PPG above the league's last "
+            "starter, with stars counting extra). The other manager is also charged for package hassle (3+ players) "
+            "and sideways same-position swaps, and overvalues what he gives up a little. "
+            "Win-Win: +1.5 or better for both in a one-for-one. Worth a Shot: they clear +1.0, you clear the slider. "
+            "Long Shot: they're between −3.0 and +1.0, you gain +2.0 or more. Mutual = your worth + their acceptance."
         )
 
         c1, c2 = st.columns(2)
@@ -436,10 +439,11 @@ def main():
         with c2:
             min_gain = st.slider(
                 "Smallest gain for you (PPG)", 0.0, 2.0, DEFAULT_MIN_GAIN, 0.1,
-                help="The smallest lineup gain for you that still counts as Worth a Shot. Lower it to see more trades.",
+                help="The smallest 'worth to you' (lineup change plus half the value you net) that still counts as "
+                     "Worth a Shot. Lower it to see more trades.",
             )
             strict = st.toggle(
-                "Strict acceptance (their MAI ≥ +1.5)",
+                "Strict acceptance (their score ≥ +1.5)",
                 value=False,
                 help="Hides trades the other manager only marginally clears. The Long Shot tier is empty in this mode.",
             )
