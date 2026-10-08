@@ -126,7 +126,7 @@ def render_proposal(t, why_label=None):
             f"- **{md_escape(t.target_name)}:** lineup {t.delta_lineup:+.1f} PPG · value {t.theirs.value_delta * 0.5:+.1f}"
             + (f" · hassle −{t.theirs.hassle:.1f}" if t.theirs.hassle else "")
             + f" · acceptance **{t.acceptance:+.1f}**\n"
-            f"- **Mutual:** {t.nmu:+.1f} · confidence: {t.confidence}\n"
+            f"- **Mutual:** {t.nmu:+.1f} · data confidence: {t.confidence}\n"
             f"- **Works because:** {md_escape(t.works_because)}\n"
             f"- **Might fail because:** {md_escape(t.fails_because)}"
         )

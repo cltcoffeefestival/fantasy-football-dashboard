@@ -7,7 +7,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trade_finder import (  # noqa: E402
     CONVEXITY, ENDOWMENT, FALLBACK_DRV, HASSLE, RAW_POINTS_ANCHOR, VALUE_WEIGHT, LeagueSnapshot, PlayerValue, TeamSnapshot,
-    TradeContext, asset_value, breakdown, build_slots, fetch_drv, generate_trades, lineup_ppg,
+    TradeContext, asset_value, breakdown, build_slots, explain, fetch_drv, generate_trades, lineup_ppg,
     single_slot_positions, slot_context, starter_levels, wanted_players, why_no_tier,
 )
 
@@ -362,12 +362,13 @@ def test_generated_trades_meet_each_tier_bar_on_both_sides():
         for t in proposals:
             assert t.tier == tier and not t.blocked
             assert t.my_effective_gain > 0 and t.you_why and t.them_why and t.mine.lineup_before
+            accept, mine = round(t.acceptance, 1), round(t.my_effective_gain, 1)   # tiers go by the shown figures
             if tier == "Win-Win":
-                assert t.acceptance >= 1.5 and t.my_effective_gain >= 1.5 and t.simple
+                assert accept >= 1.5 and mine >= 1.5 and t.simple
             if tier == "Worth a Shot":
-                assert t.acceptance >= 0.5 and t.my_effective_gain >= 0.3
+                assert accept >= 0.5 and mine >= 0.3
             if tier == "Long Shot":
-                assert -3.0 <= t.acceptance < 0.5 and t.my_effective_gain >= 2.0
+                assert -3.0 <= accept < 0.5 and mine >= 2.0
 
 
 def test_generation_starts_from_what_each_manager_would_start():
@@ -413,3 +414,76 @@ def test_every_proposal_carries_a_full_quality_breakdown():
     for needed in ("Lineup", "Value in / out", "Shape", "Need solved", "Best player out", "Total"):
         assert needed in labels
     assert t.confidence in ("high", "medium", "low") and t.works_because and t.fails_because
+
+
+# ---- what the write-up says, and tier edges
+
+def test_tier_goes_by_the_figures_as_displayed():
+    """A trade shown as +1.5 for both sides is a Win-Win even if the raw numbers are 1.46 and 1.48"""
+    me = core("m", [P("mRB3", "RB", 13)], wr=(14, 9))
+    target = core("t", [P("tWR3", "WR", 12.5)], rb=(15, 8))
+    tc = TradeContext(snapshot(me, target), 1, 2)
+    t = tc.evaluate([p for p in tc.mine.team.players if p.name == "mRB3"], [p for p in tc.theirs.team.players if p.name == "tWR3"])
+    t.theirs.lineup_delta, t.theirs.value_delta, t.theirs.hassle, t.theirs.lateral, t.theirs.freed = 1.46, 0.0, 0.0, 0.0, 0.0
+    t.mine.lineup_delta, t.mine.value_delta, t.mine.hassle, t.mine.lateral, t.mine.freed = 1.48, 0.0, 0.0, 0.0, 0.0
+    assert tc._assign_tier(t) == "Win-Win"
+    t.theirs.lineup_delta = 1.44
+    assert tc._assign_tier(t) == "Worth a Shot"
+
+
+def test_their_write_up_names_the_starter_they_give_up():
+    # their QB1 (20) for my spare WR (16): their WR slot improves, but Love-style, their QB leaves the lineup
+    me = core("m", [P("mWR3", "WR", 16), P("mQB2", "QB", 12)], qb=17)
+    target = core("t", [P("tQB2", "QB", 14)], qb=20, wr=(14, 7))
+    t = evaluate(snapshot(me, target), ["mWR3"], ["tQB"])
+    assert t.theirs.lost_starters and t.theirs.lost_starters[0].name == "tQB"
+    assert "they give up tQB from their lineup" in explain(t)[1]
+
+
+def test_a_part_time_starter_you_lose_is_named_with_his_starts():
+    # my RB3 (10) only starts in the week RB2 is on bye: under half the window, but not nothing
+    me = core("m", [P("mRB3", "RB", 10), P("mWR3", "WR", 11)], rb=(15, 12), wr=(14, 12))
+    me = [P("mRB2", "RB", 12, weekly=[12, 0, 12, 12]) if p.name == "mRB2" else p for p in me]
+    target = core("t", [P("tWR3", "WR", 13)], rb=(15, 9))
+    t = evaluate(snapshot(me, target), ["mRB3"], ["tWR3"])
+    assert [(p.name, share) for p, share in t.mine.part_starters] == [("mRB3", 0.25)]
+    assert "you also lose mRB3 (1 of 4 starts)" in explain(t)[0]
+
+
+def test_upgrade_gain_matches_the_two_ppgs_shown():
+    me = core("m", [P("mRB3", "RB", 13.26)], wr=(14, 9))
+    target = core("t", [P("tWR3", "WR", 12.54), P("tWR4", "WR", 12), P("tRB3", "RB", 10)], rb=(15, 10.16), wr=(14, 13))
+    t = evaluate(snapshot(me, target), ["mRB3"], ["tWR3"])
+    assert "mRB3 (13.3 PPG) starts at RB over tRB2 (10.2), +3.1 PPG" in explain(t)[1]    # not 3.0 (13.26 - 10.16)
+
+
+def test_a_bye_in_the_window_is_spelled_out_in_the_upgrade_text():
+    # my WR2 sits a bye week, and the RB I send does too: both gaps are part of what the trade moves
+    me = core("m", [P("mRB3", "RB", 14, weekly=[14, 0, 14, 14]), P("mRB4", "RB", 12)], rb=(15, 12), wr=(14, 11))
+    me = [P("mWR2", "WR", 11, weekly=[11, 0, 11, 11]) if p.name == "mWR2" else p for p in me]
+    target = core("t", [P("Pickens", "WR", 12.5), P("tWR4", "WR", 12), P("tRB3", "RB", 10)], rb=(15, 10), wr=(14, 13))
+    t = evaluate(snapshot(me, target), ["mRB3"], ["Pickens"])
+    assert "Pickens (12.5 PPG) starts at WR over mWR2 (11.0, bye in 1 of 4 weeks)" in explain(t)[0]
+    assert "mRB3 (14.0 PPG, bye in 1 of 4 weeks) starts at RB over tRB2 (10.0)" in explain(t)[1]
+
+
+def test_multi_player_friction_is_not_dressed_up_as_league_history():
+    me = core("m", [P("mRB3", "RB", 15), P("mWR3", "WR", 14)], wr=(12, 11))
+    target = core("t", [P("Alpha", "WR", 21), P("tWR3", "WR", 10)], rb=(11, 6), wr=(21, 11))
+    target = [p for p in target if p.name != "tWR1"]
+    t = evaluate(snapshot(me, target), ["mRB3", "mWR3"], ["Alpha"])
+    assert "a 3-player deal is a harder sell" in t.fails_because and "rejected every time" not in t.fails_because
+
+
+def test_a_lower_tier_does_not_repeat_a_better_tier_deal_with_padding():
+    """If RB3 for WR3 is listed in a better tier, RB3 + X for WR3 + Y is not a new Long Shot"""
+    me = core("m", [P("mWR3", "WR", 13), P("mRB3", "RB", 14), P("mRB4", "RB", 12.5), P("mWR4", "WR", 12)], wr=(14, 9))
+    target = core("t", [P("tWR3", "WR", 15), P("tWR4", "WR", 13.5), P("tRB3", "RB", 12), P("tTE2", "TE", 6.0)], rb=(15, 8))
+    result = generate_trades(snapshot(me, target), 1, 2, per_tier=5)
+    listed = []
+    for tier in ("Win-Win", "Worth a Shot", "Long Shot"):
+        for t in result[tier]:
+            s, r = {p.name for p in t.send}, {p.name for p in t.receive}
+            assert not any(s0 <= s and r0 <= r for s0, r0 in listed), f"{tier}: {s} for {r} pads an earlier deal"
+            listed.append((s, r))
+    assert listed
