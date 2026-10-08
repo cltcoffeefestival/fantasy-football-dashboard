@@ -7,7 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trade_finder import (  # noqa: E402
     CONVEXITY, ENDOWMENT, FALLBACK_DRV, HASSLE, RAW_POINTS_ANCHOR, VALUE_WEIGHT, LeagueSnapshot, PlayerValue, TeamSnapshot,
-    TradeContext, asset_value, breakdown, build_slots, explain, fetch_drv, generate_trades, lineup_ppg,
+    TradeContext, asset_value, breakdown, build_slots, displaced_players, explain, fetch_drv, generate_trades, lineup_ppg,
+    solve_window, start_shares,
     single_slot_positions, slot_context, starter_levels, wanted_players, why_no_tier,
 )
 
@@ -514,3 +515,82 @@ def test_a_doubtful_or_out_player_still_sits_and_a_questionable_one_plays():
 def test_a_player_for_nothing_carries_no_package_hassle():
     snap = snapshot(core("m", [P("a", "RB", 13)]), core("t", [P("x", "WR", 13)]))
     assert evaluate(snap, ["a"], []).theirs.hassle == 0.0
+
+
+# ---- what the other manager gives up: role, not window luck
+
+def test_the_targets_spare_qb_is_not_valued_like_a_starter():
+    # the classic deal: they have two starting QBs, I need one, I send an RB that starts for them
+    me = core("m", [P("mRB3", "RB", 9.5)], qb=15.9)
+    target = core("t", [P("Stafford", "QB", 16.5), P("tWR3", "WR", 11)], qb=18.0, rb=(14, 6.7))
+    t = evaluate(snapshot(me, target), ["mRB3"], ["Stafford"])
+    assert t.theirs.best_out_role < 0.5                            # Stafford is their backup
+    assert t.theirs.lineup_delta > 0 and t.acceptance > 0.5 and t.tier is not None
+    assert t.theirs.value_delta >= 0 or "their backup Stafford" in explain(t)[1]   # a 3rd QB for a starter is no loss
+
+
+def test_the_targets_starting_qb_still_counts_in_full():
+    me = core("m", [P("mRB3", "RB", 9.5)], qb=15.9)
+    target = core("t", rb=(14, 6.7), qb=18.0)
+    t = evaluate(snapshot(me, target), ["mRB3"], ["tQB"])
+    assert t.theirs.best_out_role == 1.0
+    assert t.theirs.lineup_delta < 0 and t.acceptance < -2 and t.tier is None
+
+
+def test_a_qb1_on_a_bye_with_hard_matchups_is_still_their_starter():
+    # Goff (18.9) sits a bye and is projected under Hurts (17.6) in two of the other three weeks, so
+    # he starts 1 of 4 in the window; by role he is still their QB1 and his value is not discounted
+    me = core("m", [P("mRB3", "RB", 9.5)], qb=15.9)
+    target = core("t", [P("Hurts", "QB", 17.6, weekly=[17.6, 18.5, 18.5, 17.6])], rb=(14, 6.7), qb=18.9)
+    target = [P("Goff", "QB", 18.9, weekly=[19.5, 0, 17.4, 17.4]) if p.name == "tQB" else p for p in target]
+    snap = snapshot(me, target)
+    tc = TradeContext(snap, 1, 2)
+    goff = next(p for p in tc.theirs.team.players if p.name == "Goff")
+    assert tc.theirs.shares[id(goff)] == 0.25 and tc.theirs.role[id(goff)] == 1.0
+    t = evaluate(snap, ["mRB3"], ["Goff"])
+    assert "backup" not in explain(t)[1] and "backup" not in t.fails_because
+    assert "the best player in the deal" in t.fails_because or "the best player in the deal" in explain(t)[1]
+    assert abs(t.theirs.value_out - asset_value(goff, snap.levels)) < 1e-9       # no bench discount
+
+
+# ---- vacated slots are described as such
+
+def test_a_newcomer_taking_a_traded_players_slot_is_not_a_hole_filled():
+    # Wilson (WR) for Jones + Stevenson: Wilson takes the flex Jones leaves, he does not "fill a slot nobody could play"
+    me = core("m", [P("Wilson", "WR", 14.9), P("mRB3", "RB", 9.1), P("Hollins", "WR", 6)], rb=(12, 9.1), wr=(15.8, 14.9))
+    me = [p for p in me if p.name != "mWR2"]
+    target = core("t", [P("Jones", "RB", 12.3), P("Stevenson", "RB", 12.0)], rb=(16, 12.3), wr=(18, 16))
+    target = [p for p in target if p.name != "tRB2"]
+    t = evaluate(snapshot(me, target), ["Wilson"], ["Jones", "Stevenson"])
+    assert "WR" not in t.theirs.need_solved
+    you, them = explain(t)
+    assert "nobody to play" not in them and "nobody to play" not in you
+    assert "leaves" in them or "over" in them
+
+
+def test_same_position_displacement_is_matched_before_any_fallback():
+    # London (my flex) for Jacobs + Johnson: Johnson replaces my TE Loveland, Jacobs takes the flex London leaves
+    me = core("m", [P("London", "WR", 15.4), P("Loveland", "TE", 8.0), P("Thomas", "WR", 5)], te=8.0, wr=(14, 12))
+    me = [p for p in me if p.name != "mTE"]
+    target = core("t", [P("Jacobs", "RB", 12.4), P("Johnson", "TE", 11.7)], rb=(14, 12.4), wr=(12, 9.6))
+    target = [p for p in target if p.name != "tRB2"]
+    t = evaluate(snapshot(me, target), ["London"], ["Jacobs", "Johnson"])
+    pairs = {p.name: (d.name if d else None) for p, d, _ in t.mine.upgrades}
+    assert pairs["Johnson"] == "Loveland" and pairs["Jacobs"] == "London"
+    assert "Jacobs (12.4 PPG) takes the WR spot London (15.4) leaves, -3.0 PPG" in explain(t)[0]
+    assert all(d.name != "London" for d in displaced_players(t.mine))
+
+
+# ---- one solve per lineup
+
+def test_one_pass_solve_matches_the_separate_point_and_share_solves():
+    roster = core("m", [P("mRB3", "RB", 10), P("mWR3", "WR", 11)], rb=(15, 12), wr=(14, 12))
+    roster = [P("mRB2", "RB", 12, weekly=[12, 0, 12, 12]) if p.name == "mRB2" else p for p in roster]
+    ppg, shares = solve_window(roster, CTX, WEEKS)
+    assert abs(ppg - lineup_ppg(roster, CTX, WEEKS)) < 1e-9
+    assert shares == start_shares(roster, CTX, WEEKS)
+
+
+def test_league_levels_are_computed_once_per_snapshot():
+    snap = snapshot(core("m"), core("t"))
+    assert snap.levels is snap.levels
