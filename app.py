@@ -100,16 +100,23 @@ def names(players):
     return " + ".join(f"**{p.name}** ({p.position}, {p.base:.1f} PPG)" for p in players)
 
 
-def lineup_table(title, impact):
-    """Slot-by-slot lineup before and after a trade, so the model's math can be checked by eye"""
+def lineup_table(title, impact, weeks):
+    """Who starts in each slot, week by week, before and after a trade, so the model's math can be
+    checked by eye. A cell that the trade doesn't touch shows one name; a cell it changes shows
+    'Lamar Jackson 20.9 → Waiver pickup 13.0'. The last column is the window average."""
     rows = []
-    for (slot, before_who, before), (_, after_who, after) in zip(impact.lineup_before, impact.lineup_after):
-        rows.append({
-            "Slot": slot,
-            "Before": f"{before_who} ({before:.1f})",
-            "After": f"{after_who} ({after:.1f})",
-            "Change": f"{after - before:+.1f}",
-        })
+    for before_row, after_row in zip(impact.lineup_before, impact.lineup_after):
+        slot, _, before, before_weekly = before_row
+        _, _, after, after_weekly = after_row
+        row = {"Slot": slot}
+        for i, ((b_name, b_pts), (a_name, a_pts)) in enumerate(zip(before_weekly, after_weekly)):
+            label = f"Wk {weeks[i]}" if i < len(weeks) else f"Week {i + 1}"
+            if b_name == a_name and abs(a_pts - b_pts) < 0.05:
+                row[label] = f"{b_name} {b_pts:.1f}"
+            else:
+                row[label] = f"{b_name} {b_pts:.1f} → {a_name} {a_pts:.1f}"
+        row["Avg"] = f"{before:.1f}" if abs(after - before) < 0.05 else f"{before:.1f} → {after:.1f} ({after - before:+.1f})"
+        rows.append(row)
     st.markdown(f"**{md_escape(title)}** · net {impact.delta:+.1f} PPG")
     st.dataframe(rows, width="stretch", hide_index=True)
 
@@ -144,8 +151,10 @@ def render_proposal(t, why_label=None):
                 st.markdown(f"**{md_escape(t.target_name)}**")
                 st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.theirs, True)], width="stretch", hide_index=True)
         with st.expander("Lineup before → after"):
-            lineup_table("You", t.mine)
-            lineup_table(t.target_name, t.theirs)
+            st.caption("Who starts in each slot each week. A cell with an arrow is one the trade changes; "
+                       "the rest stay as they are. Avg is the slot's average over the window.")
+            lineup_table("You", t.mine, t.weeks)
+            lineup_table(t.target_name, t.theirs, t.weeks)
         for note in t.notes:
             st.caption(f"⚠️ {note}")
         if t.mine.drops:
