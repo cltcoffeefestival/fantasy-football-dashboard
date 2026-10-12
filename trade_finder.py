@@ -206,8 +206,9 @@ class SideImpact:
     best_out_value: float = 0.0                          # his asset value, to compare across the two sides
     best_in: Optional[PlayerValue] = None
     after_roster: List[PlayerValue] = field(default_factory=list)   # lineup-eligible roster after the trade
-    lineup_before: List[Tuple[str, str, float]] = field(default_factory=list)
-    lineup_after: List[Tuple[str, str, float]] = field(default_factory=list)
+    # per slot: (label, who fills it, PPG over the window, [(name or 'Waiver pickup', points) per week])
+    lineup_before: List[Tuple[str, str, float, List[Tuple[str, float]]]] = field(default_factory=list)
+    lineup_after: List[Tuple[str, str, float, List[Tuple[str, float]]]] = field(default_factory=list)
     slot_notes: Dict[int, str] = field(default_factory=dict)     # id(incoming) -> why a slot counts as empty
     covers: Dict[int, int] = field(default_factory=dict)         # id(incoming) -> weeks he only covers byes/injuries
     need_solved: List[str] = field(default_factory=list)         # positions where a weak/empty slot was fixed
@@ -242,6 +243,7 @@ class TradeProposal:
     works_because: str = ""
     fails_because: str = ""
     notes: List[str] = field(default_factory=list)
+    weeks: List[int] = field(default_factory=list)     # the NFL weeks of the window (for the lineup tables)
     you_why: str = ""
     them_why: str = ""
 
@@ -442,21 +444,47 @@ def _solve_week(players: List[PlayerValue], ctx, week: int):
     return total, starters, assigned
 
 
-def lineup_rows(players: List[PlayerValue], slots, ctx, n_weeks: int) -> List[Tuple[str, str, float]]:
-    """(slot, who usually fills it, PPG) for the optimal lineup, averaged over the window"""
+WAIVER_NAME = "Waiver pickup"
+
+
+def lineup_rows(players: List[PlayerValue], slots, ctx, n_weeks: int) -> List[Tuple[str, str, float, List[Tuple[str, float]]]]:
+    """(slot, who fills it, PPG, week by week) for the optimal lineup over the window.
+
+    The PPG is the slot's average, so when two players share a slot (a QB2 covering the QB1's bye,
+    a star back from injury for the last week) both are named with their week counts: a slot
+    labelled with one name and a changed number reads as that player changing."""
     per_slot: List[List[Tuple[Optional[PlayerValue], float]]] = [[] for _ in ctx]
     for w in range(n_weeks):
         for i, entry in enumerate(_solve_week(players, ctx, w)[2]):
             per_slot[i].append(entry)
     rows = []
     for (label, _), entries in zip(slots, per_slot):
+        weekly = [(p.name if p else WAIVER_NAME, pts) for p, pts in entries]
         names: Dict[str, int] = {}
-        for p, _ in entries:
-            key = p.name if p else "Waiver pickup"
-            names[key] = names.get(key, 0) + 1
-        who = max(names, key=names.get)
-        rows.append((label, who, sum(pts for _, pts in entries) / n_weeks))
+        for name, _ in weekly:
+            names[name] = names.get(name, 0) + 1
+        if len(names) == 1:
+            who = next(iter(names))
+        else:
+            who = ", ".join(f"{name} ({count} wk{'s' if count != 1 else ''})"
+                            for name, count in sorted(names.items(), key=lambda kv: -kv[1]))
+        rows.append((label, who, sum(pts for _, pts in entries) / n_weeks, weekly))
     return rows
+
+
+def lineup_change_notes(before_row, after_row, weeks: List[int]) -> List[str]:
+    """What actually changed in a slot, week by week: 'wk 10: Lamar Jackson 23.4 → Waiver pickup 13.0'.
+    Empty when nothing did. This is what the slot's PPG change is made of."""
+    notes = []
+    for i, ((b_name, b_pts), (a_name, a_pts)) in enumerate(zip(before_row[3], after_row[3])):
+        if b_name == a_name and abs(a_pts - b_pts) < 0.05:
+            continue
+        week = f"wk {weeks[i]}" if i < len(weeks) else f"week {i + 1}"
+        if b_name == a_name:
+            notes.append(f"{week}: {b_name} {b_pts:.1f} → {a_pts:.1f}")
+        else:
+            notes.append(f"{week}: {b_name} {b_pts:.1f} → {a_name} {a_pts:.1f}")
+    return notes
 
 
 def waiver_fill_shares(players: List[PlayerValue], ctx, n_weeks: int) -> Dict[str, float]:
@@ -830,6 +858,7 @@ class TradeContext:
     def attach_lineups(self, t: TradeProposal) -> None:
         """Fill in the slot-by-slot lineups before and after (only for trades that get displayed)"""
         slots = self.snapshot.slots
+        t.weeks = list(self.snapshot.weeks)
         for side, impact in ((self.mine, t.mine), (self.theirs, t.theirs)):
             impact.lineup_before = lineup_rows(side.team.players, slots, self.ctx, self.n)
             impact.lineup_after = lineup_rows(impact.after_roster, slots, self.ctx, self.n)

@@ -9,7 +9,8 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, positions_fixed, why_no_tier,
+    DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, lineup_change_notes, positions_fixed,
+    why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -100,15 +101,22 @@ def names(players):
     return " + ".join(f"**{p.name}** ({p.position}, {p.base:.1f} PPG)" for p in players)
 
 
-def lineup_table(title, impact):
-    """Slot-by-slot lineup before and after a trade, so the model's math can be checked by eye"""
+def lineup_table(title, impact, weeks):
+    """Slot-by-slot lineup before and after a trade, so the model's math can be checked by eye.
+
+    Each number is the slot's average over the window, so a slot two players share names both
+    with their week counts, and the last column says which weeks moved and why: a QB slot can
+    drop 2.0 with the QB1 unchanged when the QB2 who covered one week has been traded away."""
     rows = []
-    for (slot, before_who, before), (_, after_who, after) in zip(impact.lineup_before, impact.lineup_after):
+    for before_row, after_row in zip(impact.lineup_before, impact.lineup_after):
+        slot, before_who, before, _ = before_row
+        _, after_who, after, _ = after_row
         rows.append({
             "Slot": slot,
             "Before": f"{before_who} ({before:.1f})",
             "After": f"{after_who} ({after:.1f})",
             "Change": f"{after - before:+.1f}",
+            "What changed": "; ".join(lineup_change_notes(before_row, after_row, weeks)),
         })
     st.markdown(f"**{md_escape(title)}** · net {impact.delta:+.1f} PPG")
     st.dataframe(rows, width="stretch", hide_index=True)
@@ -144,8 +152,10 @@ def render_proposal(t, why_label=None):
                 st.markdown(f"**{md_escape(t.target_name)}**")
                 st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.theirs, True)], width="stretch", hide_index=True)
         with st.expander("Lineup before → after"):
-            lineup_table("You", t.mine)
-            lineup_table(t.target_name, t.theirs)
+            st.caption("Each slot's points are the average over the window. When two players share a slot, both are "
+                       "named with their week counts, and the last column lists the weeks that moved.")
+            lineup_table("You", t.mine, t.weeks)
+            lineup_table(t.target_name, t.theirs, t.weeks)
         for note in t.notes:
             st.caption(f"⚠️ {note}")
         if t.mine.drops:
