@@ -7,8 +7,8 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from trade_finder import (  # noqa: E402
     CONVEXITY, ENDOWMENT, FALLBACK_DRV, HASSLE, RAW_POINTS_ANCHOR, VALUE_WEIGHT, LeagueSnapshot, PlayerValue, TeamSnapshot,
-    TradeContext, asset_value, breakdown, build_slots, displaced_players, explain, fetch_drv, generate_trades, lineup_ppg,
-    solve_window, start_shares,
+    TradeContext, apply_return_weeks, asset_value, breakdown, build_slots, displaced_players, explain, fetch_drv,
+    generate_trades, lineup_ppg, solve_window, start_shares,
     single_slot_positions, slot_context, starter_levels, wanted_players, why_no_tier,
 )
 
@@ -579,6 +579,65 @@ def test_same_position_displacement_is_matched_before_any_fallback():
     assert pairs["Johnson"] == "Loveland" and pairs["Jacobs"] == "London"
     assert "Jacobs (12.4 PPG) takes the WR spot London (15.4) leaves, -3.0 PPG" in explain(t)[0]
     assert all(d.name != "London" for d in displaced_players(t.mine))
+
+
+def test_a_qb_never_takes_the_rb_spot_a_traded_player_leaves():
+    # Dobbins + Vele for an Out QB: the QB starts over my QB in the weeks he is back, he does not
+    # "take the RB spot Dobbins leaves" (no slot can hold both positions)
+    me = core("m", [P("Dobbins", "RB", 9.2), P("Allgeier", "RB", 7.2), P("Vele", "WR", 9.7), P("Odunze", "WR", 10.5)],
+              qb=16.0, rb=(11.3, 9.2), wr=(14.7, 12.3))
+    me = [p for p in me if p.name != "mRB2"]
+    target = core("t", [P("Lamar", "QB", 20.9, injury="OUT"), P("tRB3", "RB", 6.0)], qb=20.4, rb=(19.9, 10.5))
+    t = evaluate(snapshot(me, target), ["Dobbins", "Vele"], ["Lamar"])
+    you, them = explain(t)
+    assert "takes the RB spot" not in you
+    assert "Lamar (20.9 PPG) starts at QB over mQB (16.0) in 2 of 4 weeks" in you      # Out: available weeks 3-4 only
+    # my side does not send the best player in the deal, so it is not told it does
+    assert "best player in the deal" not in you
+    assert "they give up the best player in the deal, Lamar" in them
+
+
+def test_a_bye_week_cover_is_not_a_hole_fixed():
+    # their RB1 and RB2 each sit a bye; a new RB3 only plays those two weeks, over the bench RB who
+    # covered them before. That is said as such, not as "a slot where their roster has nobody to play"
+    me = core("m", [P("mRB3", "RB", 9.9), P("mWR3", "WR", 9.7)])
+    target = core("t", [P("tRB3", "RB", 6.0), P("tWR3", "WR", 10.2)], rb=(19.9, 10.5))    # tWR3 holds the flex
+    target = [P("tRB1", "RB", 19.9, weekly=[19.9, 0, 19.9, 19.9]) if p.name == "tRB1" else p for p in target]
+    target = [P("tRB2", "RB", 10.5, weekly=[10.5, 10.5, 0, 10.5]) if p.name == "tRB2" else p for p in target]
+    t = evaluate(snapshot(me, target), ["mRB3"], ["tTE"])
+    _, them = explain(t)
+    assert "nobody to play" not in them
+    assert "mRB3 (9.9 PPG) starts at RB over tRB3 (6.0) in 2 of 4 weeks" in them
+    gain = next(g for p, _, g in t.theirs.upgrades if p.name == "mRB3")
+    assert abs(gain - 3.9) < 1e-6                                   # per week he plays, not x4
+
+
+def test_only_one_side_is_told_it_gives_up_the_best_player_in_the_deal():
+    me = core("m", [P("Good", "WR", 13.0), P("Ok", "RB", 11.0)])
+    target = core("t", [P("Star", "WR", 21.0)])
+    t = evaluate(snapshot(me, target), ["Good", "Ok"], ["Star"])
+    you, them = explain(t)
+    assert "Star" in t.fails_because and "best player in the deal" in t.fails_because
+    assert "Good is the best player in the deal" not in you and "Ok is the best player in the deal" not in you
+
+
+def test_a_return_week_overrides_the_injury_curve_without_touching_the_cached_snapshot():
+    me = core("m", [P("mRB3", "RB", 9.9)], qb=16.0)
+    target = core("t", [P("Lamar", "QB", 20.9, injury="OUT")], qb=20.4)
+    snap = snapshot(me, target)
+    before = evaluate(snap, ["mRB3"], ["Lamar"])
+    back = apply_return_weeks(snap, {"Lamar": snap.weeks[1]})
+    lamar = next(p for p in back.teams[2].players if p.name == "Lamar")
+    assert lamar.returns == snap.weeks[1] and lamar.weekly == [0.0, 20.9, 20.9, 20.9]
+    assert lamar.status_text == f"Out, back week {snap.weeks[1]}" and lamar.long_term_availability == 7 / 8
+    original = next(p for p in snap.teams[2].players if p.name == "Lamar")
+    assert original.returns is None and original.weekly == [20.9] * 4           # the cached snapshot is untouched
+    tc = TradeContext(back, 1, 2)
+    after = tc.evaluate([p for p in back.teams[1].players if p.name == "mRB3"], [lamar])
+    assert after.mine.lineup_delta > before.mine.lineup_delta                    # he starts 3 of 4 instead of 2
+    assert "Lamar (20.9 PPG) starts at QB over mQB (16.0) in 3 of 4 weeks" in explain(after)[0]
+    assert any("back week" in n for n in after.notes)
+    assert apply_return_weeks(snap, {}) is snap
 
 
 # ---- one solve per lineup
