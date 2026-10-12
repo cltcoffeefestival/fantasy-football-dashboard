@@ -56,12 +56,14 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
 .rec-bad  { color: #dc2626; }
 .rec-none { opacity: 0.5; }
 
-.stat-box {
-    border: 1px solid rgba(128, 128, 128, 0.3);
-    border-radius: 12px;
-    padding: 0.9rem 1.1rem;
-    margin-bottom: 0.75rem;
+/* Page header sits flush with the sidebar's top */
+.app-header { margin-bottom: 1rem; }
+
+/* Sidebar page list reads as a menu */
+section[data-testid="stSidebar"] div[role="radiogroup"] label {
+    padding: 0.2rem 0;
 }
 
-.stat-box h4 { margin: 0 0 0.25rem 0; }
-.stat-box p  { margin: 0.1rem 0; }
+/* Metric labels and deltas are informational, not alarms */
+div[data-testid="stMetricDelta"] { opacity: 0.75; }
+div[data-testid="stMetricDelta"] svg { display: none; }
