@@ -8,7 +8,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from trade_finder import (  # noqa: E402
     CONVEXITY, ENDOWMENT, FALLBACK_DRV, HASSLE, RAW_POINTS_ANCHOR, VALUE_WEIGHT, LeagueSnapshot, PlayerValue, TeamSnapshot,
     TradeContext, apply_return_weeks, asset_value, breakdown, build_slots, displaced_players, explain, fetch_drv,
-    generate_trades, lineup_change_notes, lineup_ppg, solve_window, start_shares,
+    generate_trades, lineup_ppg, solve_window, start_shares,
     single_slot_positions, slot_context, starter_levels, wanted_players, why_no_tier,
 )
 
@@ -640,9 +640,9 @@ def test_a_return_week_overrides_the_injury_curve_without_touching_the_cached_sn
     assert apply_return_weeks(snap, {}) is snap
 
 
-def test_a_shared_slot_names_both_players_and_says_which_week_moved():
+def test_lineup_rows_carry_the_week_by_week_occupants():
     # their QB1 sits a bye that Lamar (Out, back for the last week only) covers; trading Lamar away
-    # drops the QB slot although the QB1 is unchanged, and the table has to say so
+    # drops the QB slot although the QB1 is unchanged, and the week-by-week rows have to show that
     me = core("m", [P("mRB3", "RB", 9.9)], qb=16.0)
     target = core("t", [P("Lamar", "QB", 20.9, injury="OUT")], qb=21.2)
     target = [P("Purdy", "QB", 21.2, weekly=[21.2, 21.2, 21.2, 0]) if p.name == "tQB" else p for p in target]
@@ -653,8 +653,9 @@ def test_a_shared_slot_names_both_players_and_says_which_week_moved():
     before, after = t.theirs.lineup_before[0], t.theirs.lineup_after[0]
     assert before[0] == "QB" and before[1] == "Purdy (3 wks), Lamar (1 wk)"
     assert after[1] == "Purdy (3 wks), Waiver pickup (1 wk)"
-    assert lineup_change_notes(before, after, snap.weeks) == [f"wk {snap.weeks[3]}: Lamar 20.9 → Waiver pickup 13.0"]
-    assert lineup_change_notes(before, before, snap.weeks) == []
+    assert before[3] == [("Purdy", 21.2)] * 3 + [("Lamar", 20.9)]
+    assert after[3] == [("Purdy", 21.2)] * 3 + [("Waiver pickup", 13.0)]
+    assert abs(before[2] - after[2] - (20.9 - 13.0) / 4) < 1e-9
     assert t.weeks == snap.weeks
 
 

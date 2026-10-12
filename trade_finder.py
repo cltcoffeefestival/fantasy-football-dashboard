@@ -472,21 +472,6 @@ def lineup_rows(players: List[PlayerValue], slots, ctx, n_weeks: int) -> List[Tu
     return rows
 
 
-def lineup_change_notes(before_row, after_row, weeks: List[int]) -> List[str]:
-    """What actually changed in a slot, week by week: 'wk 10: Lamar Jackson 23.4 → Waiver pickup 13.0'.
-    Empty when nothing did. This is what the slot's PPG change is made of."""
-    notes = []
-    for i, ((b_name, b_pts), (a_name, a_pts)) in enumerate(zip(before_row[3], after_row[3])):
-        if b_name == a_name and abs(a_pts - b_pts) < 0.05:
-            continue
-        week = f"wk {weeks[i]}" if i < len(weeks) else f"week {i + 1}"
-        if b_name == a_name:
-            notes.append(f"{week}: {b_name} {b_pts:.1f} → {a_pts:.1f}")
-        else:
-            notes.append(f"{week}: {b_name} {b_pts:.1f} → {a_name} {a_pts:.1f}")
-    return notes
-
-
 def waiver_fill_shares(players: List[PlayerValue], ctx, n_weeks: int) -> Dict[str, float]:
     """position -> share of the window in which some slot that position could fill went to a waiver
     pickup (nobody on the roster could play it). A slot is 'empty' for a position only when this is

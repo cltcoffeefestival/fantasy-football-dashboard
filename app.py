@@ -9,8 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, lineup_change_notes, positions_fixed,
-    why_no_tier,
+    DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -102,22 +101,22 @@ def names(players):
 
 
 def lineup_table(title, impact, weeks):
-    """Slot-by-slot lineup before and after a trade, so the model's math can be checked by eye.
-
-    Each number is the slot's average over the window, so a slot two players share names both
-    with their week counts, and the last column says which weeks moved and why: a QB slot can
-    drop 2.0 with the QB1 unchanged when the QB2 who covered one week has been traded away."""
+    """Who starts in each slot, week by week, before and after a trade, so the model's math can be
+    checked by eye. A cell that the trade doesn't touch shows one name; a cell it changes shows
+    'Lamar Jackson 20.9 → Waiver pickup 13.0'. The last column is the window average."""
     rows = []
     for before_row, after_row in zip(impact.lineup_before, impact.lineup_after):
-        slot, before_who, before, _ = before_row
-        _, after_who, after, _ = after_row
-        rows.append({
-            "Slot": slot,
-            "Before": f"{before_who} ({before:.1f})",
-            "After": f"{after_who} ({after:.1f})",
-            "Change": f"{after - before:+.1f}",
-            "What changed": "; ".join(lineup_change_notes(before_row, after_row, weeks)),
-        })
+        slot, _, before, before_weekly = before_row
+        _, _, after, after_weekly = after_row
+        row = {"Slot": slot}
+        for i, ((b_name, b_pts), (a_name, a_pts)) in enumerate(zip(before_weekly, after_weekly)):
+            label = f"Wk {weeks[i]}" if i < len(weeks) else f"Week {i + 1}"
+            if b_name == a_name and abs(a_pts - b_pts) < 0.05:
+                row[label] = f"{b_name} {b_pts:.1f}"
+            else:
+                row[label] = f"{b_name} {b_pts:.1f} → {a_name} {a_pts:.1f}"
+        row["Avg"] = f"{before:.1f}" if abs(after - before) < 0.05 else f"{before:.1f} → {after:.1f} ({after - before:+.1f})"
+        rows.append(row)
     st.markdown(f"**{md_escape(title)}** · net {impact.delta:+.1f} PPG")
     st.dataframe(rows, width="stretch", hide_index=True)
 
@@ -152,8 +151,8 @@ def render_proposal(t, why_label=None):
                 st.markdown(f"**{md_escape(t.target_name)}**")
                 st.dataframe([{"": k, "Value": v} for k, v in breakdown(t.theirs, True)], width="stretch", hide_index=True)
         with st.expander("Lineup before → after"):
-            st.caption("Each slot's points are the average over the window. When two players share a slot, both are "
-                       "named with their week counts, and the last column lists the weeks that moved.")
+            st.caption("Who starts in each slot each week. A cell with an arrow is one the trade changes; "
+                       "the rest stay as they are. Avg is the slot's average over the window.")
             lineup_table("You", t.mine, t.weeks)
             lineup_table(t.target_name, t.theirs, t.weeks)
         for note in t.notes:
