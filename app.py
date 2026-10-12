@@ -9,7 +9,7 @@ from league_manager import LeagueManager
 from analyzer import TeamAnalyzer
 from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
-    DEFAULT_MIN_GAIN, FUNNEL_LABELS, asset_value, breakdown, positions_fixed, why_no_tier,
+    DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, positions_fixed, why_no_tier,
 )
 from config import LEAGUES
 import logging
@@ -60,9 +60,10 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
 
 
 @st.cache_data(ttl=300, show_spinner="Scanning rosters, free agents and schedules...")
-def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict, min_gain):
-    """Trade proposals for one target team (the snapshot underneath is cached too)"""
-    snapshot = cached_snapshot(_lm, league_name, weeks_ahead)
+def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict, min_gain, returns=()):
+    """Trade proposals for one target team (the snapshot underneath is cached too). `returns` is a
+    sorted tuple of (player name, NFL week he is expected back) overrides, part of the cache key."""
+    snapshot = apply_return_weeks(cached_snapshot(_lm, league_name, weeks_ahead), dict(returns))
     return generate_trades(snapshot, my_id, target_id, strict=strict, min_gain=min_gain)
 
 
@@ -89,7 +90,7 @@ def player_values_table(team, levels):
             "Window avg": round(p.avg, 1),
             "Above last starter": round(p.base - levels.get(p.position, 0.0), 1),
             "Asset value": round(asset_value(p, levels), 1),
-            "Injury": "" if not p.injured else p.injury.replace("_", " ").title(),
+            "Injury": p.status_text if p.injured else "",
             "Zero weeks": sum(1 for w in p.weekly if w == 0),
         })
     return rows
@@ -130,7 +131,10 @@ def render_proposal(t, why_label=None):
             f"- **Works because:** {md_escape(t.works_because)}\n"
             f"- **Might fail because:** {md_escape(t.fails_because)}"
         )
-        st.markdown(f"**Roster Fit Summary**\n- **Why it works for you:** {md_escape(t.you_why)}\n- **Why it works for them:** {md_escape(t.them_why)}")
+        # a trade that clears no tier (only possible from "Score your own trade") is not a pitch, so the
+        # roster-fit lines are headed neutrally instead of claiming it works
+        you_label, them_label = ("Why it works for you", "Why it works for them") if t.tier else ("What it does to you", "What it does to them")
+        st.markdown(f"**Roster Fit Summary**\n- **{you_label}:** {md_escape(t.you_why)}\n- **{them_label}:** {md_escape(t.them_why)}")
         with st.expander("Trade quality breakdown"):
             c1, c2 = st.columns(2)
             with c1:
@@ -452,6 +456,32 @@ def main():
         if team_id not in snapshot.teams:
             st.warning("Team not found in league data")
         else:
+            # ESPN's injury tag is run through a fixed curve (Out = mostly gone for the window). When you
+            # know better, say which week a player is back and every number below is recomputed with it.
+            sidelined = sorted(
+                (p for t in snapshot.teams.values() for p in t.players
+                 if p.injury in ("OUT", "DOUBTFUL", "INJURY_RESERVE", "SUSPENSION")),
+                key=lambda p: (p.injury != "OUT", -p.base),
+            )
+            returns = {}
+            if sidelined and len(snapshot.weeks) > 1:
+                with st.expander("Injured players you expect back sooner"):
+                    st.caption(
+                        "An Out tag is modeled as 0%, 30%, 60% and 85% likely to play over the next four weeks "
+                        "(IR and suspensions longer). Pick a player and the week he is back to override that; "
+                        "he then sits until that week and plays every week after."
+                    )
+                    labels = {f"{p.name} ({p.position}, {p.injury.replace('_', ' ').title()})": p.name for p in sidelined}
+                    chosen = st.multiselect("Players", list(labels), key="returns_players")
+                    for label in chosen:
+                        week = st.selectbox(
+                            f"{labels[label]} is back in week", snapshot.weeks[1:], key=f"returns_{labels[label]}",
+                        )
+                        returns[labels[label]] = int(week)
+            returns_key = tuple(sorted(returns.items()))
+            snapshot = apply_return_weeks(snapshot, returns)
+            if returns:
+                st.caption("Return weeks applied: " + ", ".join(f"{name} week {week}" for name, week in returns_key))
             st.caption(
                 f"Weeks {snapshot.weeks[0]}–{snapshot.weeks[-1]} · "
                 + ("replacement level from your league's actual free agents" if snapshot.drv_live
@@ -495,7 +525,7 @@ def main():
             target_choice = st.selectbox("Target team", ["Scan every team"] + list(others))
             if target_choice == "Scan every team":
                 for name, tid in others.items():
-                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict, min_gain)
+                    trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict, min_gain, returns_key)
                     total = sum(len(v) for v in trades.values())
                     best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "⚪" if trades.near_misses else "·")
                     extra = f" + {len(trades.near_misses)} close" if not total and trades.near_misses else ""
@@ -504,7 +534,7 @@ def main():
                         render_tiers(trades)
             else:
                 render_tiers(cached_trades(
-                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict, min_gain
+                    league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict, min_gain, returns_key
                 ))
 
             st.subheader("Score your own trade")
