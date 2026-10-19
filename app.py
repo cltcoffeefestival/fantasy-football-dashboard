@@ -10,7 +10,8 @@ from trade_finder import (
     DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, positions_fixed, why_no_tier,
 )
 from trade_history import (
-    STATUS_LABELS, STATUSES, HistoryStore, espn_trades, fit_calibration, record_from_proposal, summarize,
+    STATUS_LABELS, STATUSES, HistoryStore, espn_trades, fit_calibration, record_from_proposal,
+    score_completed_trades, summarize,
 )
 from config import LEAGUES
 from dataclasses import dataclass, field
@@ -83,6 +84,32 @@ def cached_history(league_id, season):
     if not store.enabled:
         return []
     return store.list(league_id, season)
+
+
+@st.cache_data(ttl=300, show_spinner="Re-scoring the league's completed trades...")
+def cached_completed_scores(_lm, league_name, trade_keys, _records):
+    """Both sides' acceptance for every completed ESPN trade that can still be rebuilt. `trade_keys`
+    (the trades' ESPN keys) is the cache key; scored on the default window so the result doesn't move
+    with the Trade Finder's weeks slider."""
+    return score_completed_trades(_records, cached_snapshot(_lm, league_name, WEEKS_AHEAD))
+
+
+def completed_scores(league_manager, league_name, records):
+    espn = [r for r in records if r.source == "espn"]
+    if not espn:
+        return []
+    return cached_completed_scores(league_manager, league_name, tuple(sorted(r.espn_key or "" for r in espn)), espn)
+
+
+def learning_label(records, completed):
+    offers = sum(1 for r in records if r.source == "app" and r.status in ("accepted", "rejected", "countered")
+                 and r.predicted_accept is not None)
+    parts = []
+    if offers:
+        parts.append(f"{offers} answered offer{'s' if offers != 1 else ''}")
+    if completed:
+        parts.append(f"{len(completed)} completed trade{'s' if len(completed) != 1 else ''}")
+    return " and ".join(parts)
 
 
 def history_error(e):
@@ -549,13 +576,15 @@ def trade_finder_page(league_manager, league_name, team_id):
                              snapshot.teams[team_id].name)
             for r in sorted((r for r in records if r.source == "app"), key=lambda r: r.created_at or ""):
                 log.logged[trade_key(r.to_team, r.sends, r.receives)] = r
-            learned = fit_calibration(records)
+            completed = completed_scores(league_manager, league_name, records)
+            learned = fit_calibration(records, completed)
             if learned.trained:
                 use = st.toggle(
-                    f"Learn from {learned.samples} answered offer{'s' if learned.samples != 1 else ''}",
+                    f"Learn from {learning_label(records, completed)}",
                     value=True,
                     help="Adjusts every acceptance score by how this league's managers actually answered the "
-                         "offers you logged. See the Trade History page for what it learned.",
+                         "offers you logged, and by the trades they completed (those count half). See the "
+                         "Trade History page for what it learned.",
                 )
                 calibration = learned if use else None
         st.caption(
@@ -677,7 +706,8 @@ def trade_history_page(league_manager, league_name):
         return
     mine = [r for r in records if r.source == "app"]
     completed = [r for r in records if r.source == "espn"]
-    summary = summarize(records)
+    completed_scored = completed_scores(league_manager, league_name, records)
+    summary = summarize(records, completed_scored)
     cal = summary.calibration
 
     # ---- what the model learned
@@ -694,7 +724,8 @@ def trade_history_page(league_manager, league_name):
             c4.metric("Actual yes rate", "–")
         if not cal.trained:
             st.caption("Nothing to learn from yet. Log offers from the Trade Finder (📝 on any trade) and mark "
-                       "how they were answered; every answered offer adjusts the acceptance scores.")
+                       "how they were answered; every answered offer and completed league trade adjusts the "
+                       "acceptance scores.")
         else:
             def said(shift):
                 if abs(shift) < 0.05:
@@ -705,10 +736,17 @@ def trade_history_page(league_manager, league_name):
                 f"- **Multi-player offers:** {said(summary.multi_shift)}."
             )
             st.caption(
-                f"Learned from {cal.samples} answered offer{'s' if cal.samples != 1 else ''}. With few offers the "
-                "model stays close to its defaults; each new answer moves it a little more. Trades completed on "
-                "ESPN are shown below but don't train it, because there's no record of what the model predicted for them."
+                f"Learned from {learning_label(records, completed_scored)}. With little data the model stays close "
+                "to its defaults; each new answer moves it a little more. A completed trade is re-scored by putting "
+                "the players back on their old rosters (with today's values), and counts as half an accepted offer, "
+                "because ESPN only shows the trades that went through."
             )
+        if summary.completed_total:
+            line = (f"Completed trades used: {summary.completed_used} of {summary.completed_total}"
+                    + (" (the rest have a player who has since moved on)" if summary.completed_used < summary.completed_total else ""))
+            if summary.completed_used:
+                line += f". The untrained model gave their sides a {summary.completed_predicted:.0%} chance on average; all of them said yes"
+            st.caption(line + ".")
 
     # ---- your offers
     st.markdown("#### Your logged offers")

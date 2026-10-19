@@ -22,7 +22,7 @@ from typing import Dict, Iterable, List, Optional
 
 import requests
 
-from trade_finder import PRIOR_PIVOT, Calibration
+from trade_finder import PRIOR_PIVOT, Calibration, LeagueSnapshot, TeamSnapshot, TradeContext
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +33,10 @@ STATUS_LABELS = {"sent": "Sent, no answer yet", "accepted": "Accepted", "rejecte
 # how much of a "yes" each answer is; a counter means interest but not at this price
 OUTCOME = {"accepted": 1.0, "countered": 0.5, "rejected": 0.0}
 PRIOR_STRENGTH = 3.0         # how many offers' worth of weight the untrained model carries per coefficient
+# A completed league trade is a yes from both managers, so each side becomes an accepted example. ESPN
+# only shows the trades that happened, never the ones turned down, so a whole trade counts as half an
+# offer you logged (which can be a no): a quarter for each side.
+COMPLETED_WEIGHT = 0.25
 TIMEOUT = 10
 
 
@@ -211,19 +215,92 @@ class HistoryStore:
         return len(rows)
 
 
+# --------------------------------------------------- completed trades, re-scored
+
+@dataclass
+class CompletedScore:
+    record: TradeRecord
+    from_accept: float          # the engine's raw acceptance for from_team (it said yes)
+    to_accept: float            # ... and for to_team (it said yes too)
+    multi_player: bool
+
+
+def _find(players, names):
+    """The roster's players with these names, or None if any is missing"""
+    found = []
+    pool = list(players)
+    for name in names:
+        match = next((p for p in pool if p.name == name), None)
+        if match is None:
+            return None
+        pool.remove(match)
+        found.append(match)
+    return found
+
+
+def score_completed_trade(record: TradeRecord, snapshot: LeagueSnapshot) -> Optional[CompletedScore]:
+    """Score a completed trade from both sides by putting the players back where they were.
+
+    Today's rosters hold the trade's result: from_team has what it received, to_team what it sent.
+    Swapping them back rebuilds the two rosters as they stood (apart from later moves), and the engine
+    then scores the trade as an offer to each side. Uses today's player values, so it is an estimate;
+    returns None when a player has since left either roster.
+    """
+    by_name = {t.name: t for t in snapshot.teams.values()}
+    a, b = by_name.get(record.from_team), by_name.get(record.to_team)
+    if a is None or b is None or a is b or not (record.sends or record.receives):
+        return None
+    a_now = _find(a.players, record.receives)       # what A received, now on A
+    b_now = _find(b.players, record.sends)          # what A sent, now on B
+    if a_now is None or b_now is None:
+        return None
+    a_ids, b_ids = {id(p) for p in a_now}, {id(p) for p in b_now}
+    teams = dict(snapshot.teams)
+    teams[a.team_id] = TeamSnapshot(a.team_id, a.name, [p for p in a.players if id(p) not in a_ids] + b_now, a.record)
+    teams[b.team_id] = TeamSnapshot(b.team_id, b.name, [p for p in b.players if id(p) not in b_ids] + a_now, b.record)
+    before = LeagueSnapshot(teams, snapshot.slots, snapshot.weeks, snapshot.schedule_adjusted,
+                            snapshot.drv, snapshot.drv_live, snapshot.drv_sources)
+    if not before.weeks:
+        return None
+    to_side = TradeContext(before, a.team_id, b.team_id).evaluate(b_now, a_now)     # A offers to B
+    from_side = TradeContext(before, b.team_id, a.team_id).evaluate(a_now, b_now)   # B offers to A
+    return CompletedScore(record, from_side.raw_acceptance, to_side.raw_acceptance, not to_side.simple)
+
+
+def score_completed_trades(records: Iterable[TradeRecord], snapshot: LeagueSnapshot) -> List[CompletedScore]:
+    scores = []
+    for r in records:
+        if r.source != "espn":
+            continue
+        try:
+            s = score_completed_trade(r, snapshot)
+        except Exception as e:      # an odd roster shouldn't take the page down
+            logger.warning(f"Could not score trade {r.espn_key}: {e}")
+            s = None
+        if s:
+            scores.append(s)
+    return scores
+
+
 # ------------------------------------------------------------------ learning
 
-def training_rows(records: Iterable[TradeRecord]):
-    """(raw acceptance, multi-player, outcome 0..1) for every answered offer with a prediction"""
-    return [(r.predicted_accept, r.multi_player, OUTCOME[r.status]) for r in records
+def training_rows(records: Iterable[TradeRecord], completed: Iterable[CompletedScore] = ()):
+    """(raw acceptance, multi-player, outcome 0..1, weight) for every answered offer with a prediction,
+    plus both sides of every re-scored completed trade as a down-weighted yes"""
+    rows = [(r.predicted_accept, r.multi_player, OUTCOME[r.status], 1.0) for r in records
             if r.source == "app" and r.status in OUTCOME and r.predicted_accept is not None]
+    for c in completed:
+        rows.append((c.from_accept, c.multi_player, 1.0, COMPLETED_WEIGHT))
+        rows.append((c.to_accept, c.multi_player, 1.0, COMPLETED_WEIGHT))
+    return rows
 
 
-def fit_calibration(records: Iterable[TradeRecord], prior_strength: float = PRIOR_STRENGTH,
-                    iterations: int = 50) -> Calibration:
-    """Penalized logistic regression of the answer on the engine's prediction, pulled toward the
-    untrained model (intercept -PRIOR_PIVOT, slope 1, no multi-player effect)"""
-    rows = training_rows(records)
+def fit_calibration(records: Iterable[TradeRecord], completed: Iterable[CompletedScore] = (),
+                    prior_strength: float = PRIOR_STRENGTH, iterations: int = 50) -> Calibration:
+    """Penalized, weighted logistic regression of the answer on the engine's prediction, pulled toward
+    the untrained model (intercept -PRIOR_PIVOT, slope 1, no multi-player effect)"""
+    records, completed = list(records), list(completed)
+    rows = training_rows(records, completed)
     if not rows:
         return Calibration()
     prior = [-PRIOR_PIVOT, 1.0, 0.0]
@@ -231,13 +308,13 @@ def fit_calibration(records: Iterable[TradeRecord], prior_strength: float = PRIO
     for _ in range(iterations):
         grad = [prior_strength * (theta[i] - prior[i]) for i in range(3)]
         hess = [[prior_strength if i == j else 0.0 for j in range(3)] for i in range(3)]
-        for accept, multi, y in rows:
+        for accept, multi, y, weight in rows:
             x = [1.0, accept, 1.0 if multi else 0.0]
             z = sum(t * v for t, v in zip(theta, x))
             p = 1.0 / (1.0 + math.exp(-max(-40.0, min(40.0, z))))
-            w = p * (1 - p)
+            w = weight * p * (1 - p)
             for i in range(3):
-                grad[i] += (p - y) * x[i]
+                grad[i] += weight * (p - y) * x[i]
                 for j in range(3):
                     hess[i][j] += w * x[i] * x[j]
         step = _solve3(hess, grad)
@@ -246,7 +323,8 @@ def fit_calibration(records: Iterable[TradeRecord], prior_strength: float = PRIO
             break
     # a slope at or below zero would mean "the more they gain, the less they accept"; that is noise
     theta[1] = max(theta[1], 0.1)
-    return Calibration(intercept=theta[0], slope=theta[1], multi=theta[2], samples=len(rows))
+    offers = sum(1 for *_, w in rows if w == 1.0)
+    return Calibration(intercept=theta[0], slope=theta[1], multi=theta[2], samples=offers + len(completed))
 
 
 def _solve3(a, b):
@@ -277,14 +355,19 @@ class LearningSummary:
     actual_rate: float = 0.0                 # share accepted (a counter counts half)
     single_shift: float = 0.0                # change to a 1-for-1's acceptance at the Worth a Shot bar
     multi_shift: float = 0.0                 # the same for a multi-player deal
+    completed_used: int = 0                  # completed ESPN trades that could be re-scored
+    completed_total: int = 0
+    completed_predicted: float = 0.0         # the untrained model's average chance for their sides (all were yes)
     by_manager: List[Dict] = field(default_factory=list)
 
 
-def summarize(records: List[TradeRecord], calibration: Optional[Calibration] = None) -> LearningSummary:
+def summarize(records: List[TradeRecord], completed: Iterable[CompletedScore] = (),
+              calibration: Optional[Calibration] = None) -> LearningSummary:
     """Predicted vs actual, and what the calibration changes, for the History page"""
-    cal = calibration or fit_calibration(records)
+    completed = list(completed)
+    cal = calibration or fit_calibration(records, completed)
     mine = [r for r in records if r.source == "app"]
-    rows = training_rows(mine)
+    rows = [row[:3] for row in training_rows(mine)]
     untrained = Calibration()
     s = LearningSummary(calibration=cal)
     s.answered = len(rows)
@@ -295,6 +378,11 @@ def summarize(records: List[TradeRecord], calibration: Optional[Calibration] = N
     if rows:
         s.predicted_rate = sum(untrained.chance(a, m) for a, m, _ in rows) / len(rows)
         s.actual_rate = sum(y for *_, y in rows) / len(rows)
+    s.completed_total = sum(1 for r in records if r.source == "espn")
+    s.completed_used = len(completed)
+    if completed:
+        sides = [(c.from_accept, c.multi_player) for c in completed] + [(c.to_accept, c.multi_player) for c in completed]
+        s.completed_predicted = sum(untrained.chance(a, m) for a, m in sides) / len(sides)
     if cal.trained:
         s.single_shift = cal.adjust(PRIOR_PIVOT, False) - PRIOR_PIVOT
         s.multi_shift = cal.adjust(PRIOR_PIVOT, True) - PRIOR_PIVOT
