@@ -77,28 +77,33 @@ def history_store():
 
 @st.cache_data(ttl=120, show_spinner=False)
 def cached_history(league_id, season):
-    """Every logged offer and imported trade for one league season (empty when storage is off or down)"""
+    """Every logged offer and imported trade for one league season (empty when storage is off).
+    Errors are raised, not cached, so a fixed key works on the next run."""
     store = history_store()
     if not store.enabled:
         return []
-    try:
-        return store.list(league_id, season)
-    except Exception as e:
-        logger.warning(f"Trade history unavailable: {e}")
-        return []
+    return store.list(league_id, season)
+
+
+def history_error(e):
+    """A readable reason the trade log couldn't be reached"""
+    status = getattr(getattr(e, "response", None), "status_code", None)
+    if status in (401, 403):
+        return ("Supabase rejected the key. Check that `SUPABASE_KEY` in the app's secrets is the project's "
+                "secret key (starts with `sb_secret_`), pasted with nothing around it but quotes.")
+    if status == 404:
+        return "Supabase has no `trade_log` table at `SUPABASE_URL`. Check the URL, or create the table from `supabase/trade_log.sql`."
+    return f"Couldn't reach the trade log: {e}"
 
 
 @st.cache_data(ttl=900, show_spinner=False)
 def import_league_trades(_league, league_id, season):
-    """Copy completed ESPN trades into the log (at most every 15 minutes per league)"""
+    """Copy completed ESPN trades into the log (at most every 15 minutes per league). A failed write
+    raises, so it isn't cached and is retried on the next run."""
     store = history_store()
     if not store.enabled:
         return 0
-    try:
-        sent = store.import_espn(espn_trades(_league))
-    except Exception as e:
-        logger.warning(f"ESPN trade import failed: {e}")
-        return 0
+    sent = store.import_espn(espn_trades(_league))
     cached_history.clear()
     return sent
 
@@ -535,7 +540,11 @@ def trade_finder_page(league_manager, league_name, team_id):
         store = history_store()
         log, calibration = None, None
         if store.enabled:
-            records = cached_history(league.league_id, league.year)
+            try:
+                records = cached_history(league.league_id, league.year)
+            except Exception as e:
+                st.warning(history_error(e))
+                records = []
             log = LogContext(store, league.league_id, league.year, getattr(league, "current_week", None),
                              snapshot.teams[team_id].name)
             for r in sorted((r for r in records if r.source == "app"), key=lambda r: r.created_at or ""):
@@ -660,8 +669,12 @@ def trade_history_page(league_manager, league_name):
         )
         return
     league = league_manager.leagues[league_name]
-    import_league_trades(league, league.league_id, league.year)
-    records = cached_history(league.league_id, league.year)
+    try:
+        import_league_trades(league, league.league_id, league.year)
+        records = cached_history(league.league_id, league.year)
+    except Exception as e:
+        st.error(history_error(e))
+        return
     mine = [r for r in records if r.source == "app"]
     completed = [r for r in records if r.source == "espn"]
     summary = summarize(records)

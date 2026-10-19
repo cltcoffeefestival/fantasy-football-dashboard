@@ -161,7 +161,8 @@ class HistoryStore:
 
     def __init__(self, url: Optional[str] = None, key: Optional[str] = None, session=None):
         self.url = (url if url is not None else os.getenv("SUPABASE_URL", "")).rstrip("/")
-        self.key = key if key is not None else os.getenv("SUPABASE_KEY", "")
+        # forgive the usual paste slips: spaces, extra quotes, or the <...> from a placeholder
+        self.key = (key if key is not None else os.getenv("SUPABASE_KEY", "")).strip().strip("\"'<> ")
         self.session = session or requests.Session()
 
     @property

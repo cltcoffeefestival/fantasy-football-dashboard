@@ -174,3 +174,8 @@ def test_store_requests():
     assert method == "PATCH" and kw["params"] == {"id": "eq.5"} and kw["json"]["status"] == "rejected"
     jwt = HistoryStore(url="https://x", key="eyJabc", session=FakeSession())
     assert jwt._headers()["Authorization"] == "Bearer eyJabc"
+
+
+def test_store_forgives_a_key_pasted_with_brackets_or_spaces():
+    assert HistoryStore(url="https://x", key=' <sb_secret_abc> ').key == "sb_secret_abc"
+    assert HistoryStore(url="https://x", key='"sb_secret_abc"\n').key == "sb_secret_abc"
