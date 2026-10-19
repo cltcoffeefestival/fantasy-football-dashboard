@@ -174,3 +174,47 @@ def test_store_requests():
     assert method == "PATCH" and kw["params"] == {"id": "eq.5"} and kw["json"]["status"] == "rejected"
     jwt = HistoryStore(url="https://x", key="eyJabc", session=FakeSession())
     assert jwt._headers()["Authorization"] == "Bearer eyJabc"
+
+
+def test_store_forgives_a_key_pasted_with_brackets_or_spaces():
+    assert HistoryStore(url="https://x", key=' <sb_secret_abc> ').key == "sb_secret_abc"
+    assert HistoryStore(url="https://x", key='"sb_secret_abc"\n').key == "sb_secret_abc"
+
+
+def _after_trade():
+    """The hole-filling Win-Win after it happened: mRB3 now on Them, tWR3 now on Me"""
+    me = core("m", [P("tWR3", "WR", 12.5), P("mRB4", "RB", 12.5)], wr=(14, 8))
+    target = core("t", [P("mRB3", "RB", 13), P("tWR4", "WR", 11)], rb=(15, 8))
+    return snapshot(me, target)
+
+
+def test_a_completed_trade_is_rescored_on_the_rosters_before_it():
+    from trade_history import score_completed_trade
+    done = TradeRecord(1, 2026, "Me", "Them", ["mRB3"], ["tWR3"], "completed", source="espn", espn_key="k")
+    s = score_completed_trade(done, _after_trade())
+    one, _ = _hole_filler()
+    assert s is not None and not s.multi_player
+    assert abs(s.to_accept - one.raw_acceptance) < 1e-9          # same as offering it before it happened
+    assert s.from_accept > 0
+
+
+def test_a_completed_trade_with_a_departed_player_is_skipped():
+    from trade_history import score_completed_trade
+    gone = TradeRecord(1, 2026, "Me", "Them", ["mRB3"], ["Somebody Cut"], "completed", source="espn")
+    assert score_completed_trade(gone, _after_trade()) is None
+    stranger = TradeRecord(1, 2026, "Me", "Nobody", ["mRB3"], ["tWR3"], "completed", source="espn")
+    assert score_completed_trade(stranger, _after_trade()) is None
+
+
+def test_completed_trades_count_half_and_only_pull_acceptance_up():
+    from trade_history import CompletedScore
+    rec = TradeRecord(1, 2026, "A", "B", ["x"], ["y"], "completed", source="espn")
+    stretch = [CompletedScore(rec, -1.0, -1.0, False) for _ in range(8)]
+    cal = fit_calibration([], stretch)
+    assert cal.trained and cal.samples == 8
+    assert cal.adjust(-1.0, False) > -1.0                        # deals the model called a stretch got done
+    logged = fit_calibration([offer(-1.0, "accepted") for _ in range(4)])
+    # each completed trade is half an accepted offer: eight trades weigh the same as four offers
+    assert abs(logged.adjust(-1.0, False) - cal.adjust(-1.0, False)) < 1e-6
+    s = summarize([rec], stretch)
+    assert s.completed_used == 8 and s.completed_total == 1 and 0 < s.completed_predicted < 0.5
