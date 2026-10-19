@@ -24,6 +24,7 @@ status move the 4-week lineup numbers; the asset value uses the season blend, di
 for injuries long enough to matter beyond the window.
 """
 import copy
+import math
 from dataclasses import dataclass, field
 from functools import cached_property
 from itertools import combinations
@@ -102,6 +103,41 @@ POOL_SIZE = 8                # players per side considered in a swap
 
 # Used only when the free agent lookup fails: rough full-PPR waiver-wire PPG by position
 FALLBACK_DRV = {"QB": 13.0, "RB": 8.5, "WR": 9.5, "TE": 6.5, "D/ST": 6.0, "K": 7.0}
+
+# The untrained acceptance model: an offer the target scores at +0.5 (the Worth a Shot bar) is a
+# coin flip, and each PPG either way moves the odds by one unit of log-odds.
+PRIOR_PIVOT = 0.5
+
+
+@dataclass(frozen=True)
+class Calibration:
+    """What logged offers taught the engine about how this league's managers really answer.
+
+    The fitted model is   P(accept) = sigmoid(intercept + slope * acceptance + multi * is_multi_player)
+    and the untrained one is the same with (-PRIOR_PIVOT, 1, 0). `adjust` maps a raw acceptance
+    score to the score the untrained model would need to give the learned odds, so the tier bars
+    keep their meaning: a league that turns down offers the engine liked lowers every acceptance,
+    and a league that hates multi-player packages charges them extra hassle.
+    """
+    intercept: float = -PRIOR_PIVOT
+    slope: float = 1.0
+    multi: float = 0.0
+    samples: int = 0
+
+    @property
+    def trained(self) -> bool:
+        return self.samples > 0
+
+    def logit(self, acceptance: float, multi_player: bool) -> float:
+        return self.intercept + self.slope * acceptance + (self.multi if multi_player else 0.0)
+
+    def adjust(self, acceptance: float, multi_player: bool) -> float:
+        return self.logit(acceptance, multi_player) + PRIOR_PIVOT
+
+    def chance(self, acceptance: float, multi_player: bool) -> float:
+        """The learned probability the target says yes"""
+        z = self.logit(acceptance, multi_player)
+        return 1.0 / (1.0 + math.exp(-z)) if z > -40 else 0.0
 
 
 @dataclass
@@ -246,11 +282,32 @@ class TradeProposal:
     weeks: List[int] = field(default_factory=list)     # the NFL weeks of the window (for the lineup tables)
     you_why: str = ""
     them_why: str = ""
+    calibration: Optional[Calibration] = None          # learned from logged offers (trade_history.py)
+
+    @property
+    def raw_acceptance(self) -> float:
+        """The engine's own score for the other side, before anything learned from past offers"""
+        return self.theirs.total
 
     @property
     def acceptance(self) -> float:
-        """How a normal manager on the other side would feel about this (PPG-equivalent)"""
-        return self.theirs.total
+        """How the manager on the other side would feel about this (PPG-equivalent), corrected by
+        what past offers in this league taught the engine when a calibration is attached"""
+        if self.calibration is None or not self.calibration.trained:
+            return self.theirs.total
+        return self.calibration.adjust(self.theirs.total, not self.simple)
+
+    @property
+    def learned_shift(self) -> float:
+        """How much the learned calibration moved the acceptance score"""
+        return self.acceptance - self.raw_acceptance
+
+    @property
+    def accept_chance(self) -> Optional[float]:
+        """The learned probability the other manager accepts, or None before any offers are logged"""
+        if self.calibration is None or not self.calibration.trained:
+            return None
+        return self.calibration.chance(self.theirs.total, not self.simple)
 
     mai = acceptance             # old name, still used by the UI
 
@@ -658,8 +715,10 @@ class Side:
 class TradeContext:
     """Everything about one (you, target) pair that doesn't change between candidate trades"""
 
-    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int, min_gain: float = DEFAULT_MIN_GAIN):
+    def __init__(self, snapshot: LeagueSnapshot, my_id: int, target_id: int, min_gain: float = DEFAULT_MIN_GAIN,
+                 calibration: Optional[Calibration] = None):
         self.snapshot = snapshot
+        self.calibration = calibration
         self.min_gain = min_gain     # your smallest gain for a Worth a Shot trade (PPG)
         self.n = len(snapshot.weeks)
         self.drv = snapshot.drv
@@ -832,6 +891,7 @@ class TradeContext:
             mine=mine,
             theirs=theirs,
             min_gain=self.min_gain,
+            calibration=self.calibration,
             alpha_assets=[p for p in receive if id(p) in self.s_tier],
             notes=_notes(send, receive),
         )
@@ -1060,6 +1120,7 @@ def generate_trades(
     strict: bool = False,
     per_tier: int = PER_TIER,
     min_gain: float = DEFAULT_MIN_GAIN,
+    calibration: Optional[Calibration] = None,
 ) -> TradeResults:
     """Proposals in each acceptance tier for one target team, best mutual utility first.
 
@@ -1071,7 +1132,7 @@ def generate_trades(
     if my_id not in snapshot.teams or target_id not in snapshot.teams or my_id == target_id:
         return result
 
-    tc = TradeContext(snapshot, my_id, target_id, min_gain=min_gain)
+    tc = TradeContext(snapshot, my_id, target_id, min_gain=min_gain, calibration=calibration)
     if tc.n == 0:
         return result
 
@@ -1124,10 +1185,11 @@ def generate_trades(
 
 
 def evaluate_custom(
-    snapshot: LeagueSnapshot, my_id: int, target_id: int, send, receive, min_gain: float = DEFAULT_MIN_GAIN
+    snapshot: LeagueSnapshot, my_id: int, target_id: int, send, receive, min_gain: float = DEFAULT_MIN_GAIN,
+    calibration: Optional[Calibration] = None,
 ) -> TradeProposal:
     """Score a specific trade you typed in (same math as the generated ones)"""
-    tc = TradeContext(snapshot, my_id, target_id, min_gain=min_gain)
+    tc = TradeContext(snapshot, my_id, target_id, min_gain=min_gain, calibration=calibration)
     t = tc.evaluate(list(send), list(receive))
     t.you_why, t.them_why = explain(t)
     tc.attach_lineups(t)
