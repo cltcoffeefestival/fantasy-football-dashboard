@@ -8,6 +8,7 @@ A comprehensive web dashboard to analyze your ESPN Fantasy Football teams across
 - **My Teams**: record, standing, points per week and the roster grouped by position
 - **Waiver Wire**: best available free agent at each position, plus a filterable free agent table
 - **Trade Finder**: finds trades that work for both managers. Each side is scored on starting-lineup change plus asset value (PPG above the league's last starter, convex so stars count more), and the other manager is also charged package hassle and sideways-swap friction. Proposes Win-Win, Worth a Shot and Long Shot trades for any team (or every team), scores trades you type in, lets you say which week an injured player is really back (ESPN's Out tag is otherwise modeled as mostly gone for the window), and shows a full quality breakdown per trade (see `docs/trade_engine_audit.md`)
+- **Trade History**: log any Trade Finder offer and how it was answered (sent, accepted, rejected, countered), and see the league's completed trades pulled from ESPN. Answered offers train a small calibration of the acceptance score, per league, so the finder learns how your league's managers really respond (for example, charging multi-player packages extra if they keep getting turned down). Needs Supabase, see below
 - **Team Analysis**: team summary
 - **Standings**: points-for chart and full standings for each league
 
@@ -71,6 +72,8 @@ fantasy-football-dashboard/
 ├── league_manager.py    # ESPN API integration
 ├── analyzer.py          # Analysis and recommendations
 ├── trade_finder.py      # Trade engine (lineup + asset value + friction, trade generation)
+├── trade_history.py     # Trade log (Supabase), ESPN trade import, learned acceptance calibration
+├── supabase/            # SQL for the trade_log table
 ├── docs/                # Trade engine audit and design notes
 ├── tests/               # pytest suite for the trade engine
 ├── config.py            # League IDs and settings
@@ -89,6 +92,9 @@ when deploying.
 
 1. Push the repo to GitHub and create an app at [share.streamlit.io](https://share.streamlit.io) with `app.py` as the main file.
 2. Under **Advanced settings → Secrets**, add `ESPN_S2` and `SWID` (see `.streamlit/secrets.toml.example`).
+   For trade history, also add `SUPABASE_URL` and `SUPABASE_KEY` (the project's **secret** key from
+   Supabase → Project Settings → API Keys). The table is in `supabase/trade_log.sql`. Without these the
+   Trade History page explains what's missing and everything else works as before.
 3. Restrict viewing to specific emails under the app's sharing settings, since it uses your ESPN login.
 
 If leagues stop loading, your ESPN cookies have probably expired: refresh them.

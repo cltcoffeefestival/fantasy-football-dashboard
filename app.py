@@ -9,7 +9,11 @@ from trade_finder import (
     TIERS, WEEKS_AHEAD, build_league_snapshot, displaced_players, evaluate_custom, generate_trades, needs_table,
     DEFAULT_MIN_GAIN, FUNNEL_LABELS, apply_return_weeks, asset_value, breakdown, positions_fixed, why_no_tier,
 )
+from trade_history import (
+    STATUS_LABELS, STATUSES, HistoryStore, espn_trades, fit_calibration, record_from_proposal, summarize,
+)
 from config import LEAGUES
+from dataclasses import dataclass, field
 import logging
 import re
 from pathlib import Path
@@ -58,15 +62,65 @@ def cached_snapshot(_lm, league_name, weeks_ahead):
 
 
 @st.cache_data(ttl=300, show_spinner="Scanning rosters, free agents and schedules...")
-def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict, min_gain, returns=()):
+def cached_trades(_lm, league_name, weeks_ahead, my_id, target_id, strict, min_gain, returns=(), calibration=None):
     """Trade proposals for one target team (the snapshot underneath is cached too). `returns` is a
-    sorted tuple of (player name, NFL week he is expected back) overrides, part of the cache key."""
+    sorted tuple of (player name, NFL week he is expected back) overrides, part of the cache key, and
+    `calibration` is what logged offers taught the engine (None to score untrained)."""
     snapshot = apply_return_weeks(cached_snapshot(_lm, league_name, weeks_ahead), dict(returns))
-    return generate_trades(snapshot, my_id, target_id, strict=strict, min_gain=min_gain)
+    return generate_trades(snapshot, my_id, target_id, strict=strict, min_gain=min_gain, calibration=calibration)
 
 
-PAGES = ["Overview", "My Team", "Waiver Wire", "Trade Finder", "Standings"]
-PAGE_ICONS = {"Overview": "🏠", "My Team": "👥", "Waiver Wire": "📋", "Trade Finder": "🔁", "Standings": "🏆"}
+@st.cache_resource
+def history_store():
+    return HistoryStore()
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def cached_history(league_id, season):
+    """Every logged offer and imported trade for one league season (empty when storage is off or down)"""
+    store = history_store()
+    if not store.enabled:
+        return []
+    try:
+        return store.list(league_id, season)
+    except Exception as e:
+        logger.warning(f"Trade history unavailable: {e}")
+        return []
+
+
+@st.cache_data(ttl=900, show_spinner=False)
+def import_league_trades(_league, league_id, season):
+    """Copy completed ESPN trades into the log (at most every 15 minutes per league)"""
+    store = history_store()
+    if not store.enabled:
+        return 0
+    try:
+        sent = store.import_espn(espn_trades(_league))
+    except Exception as e:
+        logger.warning(f"ESPN trade import failed: {e}")
+        return 0
+    cached_history.clear()
+    return sent
+
+
+@dataclass
+class LogContext:
+    """What a proposal card needs to log an offer"""
+    store: HistoryStore
+    league_id: int
+    season: int
+    week: int
+    my_team: str
+    logged: dict = field(default_factory=dict)     # (to_team, sends, receives) -> latest logged record
+
+
+def trade_key(to_team, sends, receives):
+    return (to_team, tuple(sorted(sends)), tuple(sorted(receives)))
+
+
+PAGES = ["Overview", "My Team", "Waiver Wire", "Trade Finder", "Trade History", "Standings"]
+PAGE_ICONS = {"Overview": "🏠", "My Team": "👥", "Waiver Wire": "📋", "Trade Finder": "🔁",
+              "Trade History": "📜", "Standings": "🏆"}
 POSITION_ORDER = ["QB", "RB", "WR", "TE", "D/ST", "K"]
 
 # tier -> (icon, title, one-line meaning)
@@ -142,7 +196,30 @@ def lineup_table(title, impact, weeks):
     st.dataframe(rows, width="stretch", hide_index=True)
 
 
-def render_proposal(t):
+def render_log_control(t, log, scope):
+    """Log this offer and its answer, so the engine can learn how this manager responds"""
+    key = trade_key(t.target_name, [p.name for p in t.send], [p.name for p in t.receive])
+    previous = log.logged.get(key)
+    widget = "log_" + scope + "_" + "|".join([key[0], *key[1], "for", *key[2]])
+    with st.popover("📝 Logged: " + STATUS_LABELS[previous.status] if previous else "📝 Log this offer"):
+        if previous:
+            st.caption(f"Logged {previous.created_at[:10] if previous.created_at else ''} as "
+                       f"{STATUS_LABELS[previous.status].lower()}. Update it on the Trade History page.")
+        status = st.radio("What happened?", STATUSES, format_func=STATUS_LABELS.get, key=widget + "_status")
+        notes = st.text_input("Notes (optional)", key=widget + "_notes")
+        if st.button("Save to history", key=widget + "_save", type="primary"):
+            try:
+                log.store.add(record_from_proposal(t, log.league_id, log.season, log.my_team, status,
+                                                   week=log.week, notes=notes))
+            except Exception as e:
+                st.error(f"Could not save: {e}")
+            else:
+                cached_history.clear()
+                st.toast("Saved to trade history")
+                st.rerun()
+
+
+def render_proposal(t, log=None, scope=""):
     """One trade card: the deal, the three numbers that decide it, the reasons, and the details folded away"""
     with st.container(border=True):
         st.markdown(f"You send {names(t.send)} &nbsp;↔&nbsp; you receive {names(t.receive)}")
@@ -153,7 +230,9 @@ def render_proposal(t):
                   f"lineup {t.my_gain:+.1f} · value {t.mine.value_delta * 0.5:+.1f}", delta_color="off")
         c2.metric(f"Acceptance for {them}", f"{t.acceptance:+.1f}",
                   f"lineup {t.delta_lineup:+.1f} · value {t.theirs.value_delta * 0.5:+.1f}"
-                  + (f" · hassle −{t.theirs.hassle:.1f}" if t.theirs.hassle else ""), delta_color="off")
+                  + (f" · hassle −{t.theirs.hassle:.1f}" if t.theirs.hassle else "")
+                  + (f" · learned {t.learned_shift:+.1f}" if t.accept_chance is not None and abs(t.learned_shift) >= 0.05 else ""),
+                  delta_color="off")
         c3.metric("Mutual", f"{t.nmu:+.1f}", f"data confidence {t.confidence}", delta_color="off")
 
         st.markdown(
@@ -170,6 +249,10 @@ def render_proposal(t):
             st.caption("You would cut: " + ", ".join(p.name for p in t.mine.drops))
         if t.theirs.drops:
             st.caption("They would cut: " + ", ".join(p.name for p in t.theirs.drops))
+        if t.accept_chance is not None:
+            st.caption(f"Based on your logged offers, about a {t.accept_chance:.0%} chance {them} says yes.")
+        if log is not None:
+            render_log_control(t, log, scope)
 
         with st.expander("Details: scoring breakdown and lineups week by week"):
             fixed = ", ".join(positions_fixed(t.mine)) or "none"
@@ -188,7 +271,7 @@ def render_proposal(t):
             lineup_table(t.target_name, t.theirs, t.weeks)
 
 
-def render_misses(trades):
+def render_misses(trades, log=None):
     """When few or no trades clear a tier: why, and the closest fair trades"""
     total = sum(len(trades[t]) for t in TIERS)
     if total == 0 and trades.funnel:
@@ -199,10 +282,10 @@ def render_misses(trades):
             st.caption("Plausible trades that don't clear a tier: fair or a stretch for them, and a small edge for you. Each says what it missed.")
             for t in trades.near_misses:
                 st.markdown(f"⚪ {why_no_tier(t)}")
-                render_proposal(t)
+                render_proposal(t, log, "miss")
 
 
-def render_tiers(trades):
+def render_tiers(trades, log=None):
     total = sum(len(trades[t]) for t in TIERS)
     for tier in TIERS:
         if not trades[tier]:
@@ -211,12 +294,12 @@ def render_tiers(trades):
         st.markdown(f"#### {icon} {title}")
         st.caption(meaning)
         for t in trades[tier]:
-            render_proposal(t)
+            render_proposal(t, log, tier)
     if total:
         empty = [TIER_STYLE[t][1] for t in TIERS if not trades[t]]
         if empty:
             st.caption("No proposal in: " + ", ".join(empty) + ".")
-    render_misses(trades)
+    render_misses(trades, log)
 
 
 # ------------------------------------------------------------------ overview widgets
@@ -446,6 +529,26 @@ def trade_finder_page(league_manager, league_name, team_id):
                     returns[labels[label]] = int(week)
         returns_key = tuple(sorted(returns.items()))
         snapshot = apply_return_weeks(snapshot, returns)
+
+        # what logged offers taught the engine about this league's managers
+        league = league_manager.leagues[league_name]
+        store = history_store()
+        log, calibration = None, None
+        if store.enabled:
+            records = cached_history(league.league_id, league.year)
+            log = LogContext(store, league.league_id, league.year, getattr(league, "current_week", None),
+                             snapshot.teams[team_id].name)
+            for r in sorted((r for r in records if r.source == "app"), key=lambda r: r.created_at or ""):
+                log.logged[trade_key(r.to_team, r.sends, r.receives)] = r
+            learned = fit_calibration(records)
+            if learned.trained:
+                use = st.toggle(
+                    f"Learn from {learned.samples} answered offer{'s' if learned.samples != 1 else ''}",
+                    value=True,
+                    help="Adjusts every acceptance score by how this league's managers actually answered the "
+                         "offers you logged. See the Trade History page for what it learned.",
+                )
+                calibration = learned if use else None
         st.caption(
             f"Weeks {snapshot.weeks[0]}–{snapshot.weeks[-1]} · "
             + ("replacement level from this league's free agents" if snapshot.drv_live
@@ -453,6 +556,7 @@ def trade_finder_page(league_manager, league_name, team_id):
             + " · "
             + ("matchup difficulty included" if snapshot.schedule_adjusted else "⚠️ matchup ratings unavailable")
             + (" · return weeks applied: " + ", ".join(f"{name} wk {week}" for name, week in returns_key) if returns else "")
+            + (" · acceptance learned from your logged offers" if calibration else "")
         )
 
     others = {t.name: tid for tid, t in snapshot.teams.items() if tid != team_id}
@@ -462,17 +566,19 @@ def trade_finder_page(league_manager, league_name, team_id):
         target_choice = st.selectbox("Trade partner", ["Scan every team"] + list(others))
         if target_choice == "Scan every team":
             for name, tid in others.items():
-                trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict, min_gain, returns_key)
+                trades = cached_trades(league_manager, league_name, weeks_ahead, team_id, tid, strict, min_gain, returns_key,
+                                       calibration)
                 total = sum(len(v) for v in trades.values())
                 best = next((TIER_STYLE[t][0] for t in TIERS if trades[t]), "⚪" if trades.near_misses else "⚫")
                 extra = f" + {len(trades.near_misses)} close" if not total and trades.near_misses else ""
                 label = f"{best} {md_escape(name)} ({snapshot.teams[tid].record}) · {total} proposal{'s' if total != 1 else ''}{extra}"
                 with st.expander(label, expanded=False):
-                    render_tiers(trades)
+                    render_tiers(trades, log)
         else:
             render_tiers(cached_trades(
-                league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict, min_gain, returns_key
-            ))
+                league_manager, league_name, weeks_ahead, team_id, others[target_choice], strict, min_gain, returns_key,
+                calibration,
+            ), log)
 
     with score_tab:
         e1, e2 = st.columns(2)
@@ -489,6 +595,7 @@ def trade_finder_page(league_manager, league_name, team_id):
                 [p for p in mine if p.name in send_names],
                 [p for p in theirs if p.name in recv_names],
                 min_gain=min_gain,
+                calibration=calibration,
             )
             if t.tier:
                 icon, title, meaning = TIER_STYLE[t.tier]
@@ -497,7 +604,7 @@ def trade_finder_page(league_manager, league_name, team_id):
             else:
                 st.markdown("#### ⛔ Does not clear any tier")
                 st.info(why_no_tier(t))
-            render_proposal(t)
+            render_proposal(t, log, "custom")
         else:
             st.caption("Pick what you send and what you receive to score the trade with the same math as the finder.")
 
@@ -510,7 +617,9 @@ def trade_finder_page(league_manager, league_name, team_id):
             "- 🟢 **Win-Win**: +1.5 or better for both, one-for-one only.\n"
             "- 🟡 **Worth a Shot**: they clear +1.0, you clear the slider.\n"
             "- 🔴 **Long Shot**: they're between −3.0 and +1.0, you gain +2.0 or more.\n\n"
-            "Mutual = your worth + their acceptance."
+            "Mutual = your worth + their acceptance.\n\n"
+            "Once you log offers and their answers (📝 on any trade), acceptance is also corrected by how "
+            "this league's managers actually answered. The Trade History page shows what it learned."
         )
         st.caption(
             "Last-starter levels (value is measured against these): "
@@ -539,6 +648,109 @@ def trade_finder_page(league_manager, league_name, team_id):
                 for name, blend, avg, proj in found
             ]
             st.dataframe(rows, width="stretch", hide_index=True)
+
+
+def trade_history_page(league_manager, league_name):
+    page_title("Trade History", "Offers you logged, trades completed in the league, and what the model learned")
+    store = history_store()
+    if not store.enabled:
+        st.info(
+            "Trade history needs a database so it survives app restarts. Add `SUPABASE_URL` and "
+            "`SUPABASE_KEY` (the project's secret key) to the app's secrets, then reload."
+        )
+        return
+    league = league_manager.leagues[league_name]
+    import_league_trades(league, league.league_id, league.year)
+    records = cached_history(league.league_id, league.year)
+    mine = [r for r in records if r.source == "app"]
+    completed = [r for r in records if r.source == "espn"]
+    summary = summarize(records)
+    cal = summary.calibration
+
+    # ---- what the model learned
+    with st.container(border=True):
+        st.markdown("#### What the model learned")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Offers logged", len(mine), f"{summary.pending} awaiting an answer", delta_color="off")
+        c2.metric("Accepted", summary.accepted, f"{summary.countered} countered · {summary.rejected} rejected", delta_color="off")
+        if summary.answered:
+            c3.metric("Predicted yes rate", f"{summary.predicted_rate:.0%}", "before learning", delta_color="off")
+            c4.metric("Actual yes rate", f"{summary.actual_rate:.0%}", "a counter counts half", delta_color="off")
+        else:
+            c3.metric("Predicted yes rate", "–")
+            c4.metric("Actual yes rate", "–")
+        if not cal.trained:
+            st.caption("Nothing to learn from yet. Log offers from the Trade Finder (📝 on any trade) and mark "
+                       "how they were answered; every answered offer adjusts the acceptance scores.")
+        else:
+            def said(shift):
+                if abs(shift) < 0.05:
+                    return "about as predicted"
+                return f"{shift:+.1f} PPG {'easier' if shift > 0 else 'harder'} to please than the model assumed"
+            st.markdown(
+                f"- **One-for-one offers:** managers here are {said(summary.single_shift)}.\n"
+                f"- **Multi-player offers:** {said(summary.multi_shift)}."
+            )
+            st.caption(
+                f"Learned from {cal.samples} answered offer{'s' if cal.samples != 1 else ''}. With few offers the "
+                "model stays close to its defaults; each new answer moves it a little more. Trades completed on "
+                "ESPN are shown below but don't train it, because there's no record of what the model predicted for them."
+            )
+
+    # ---- your offers
+    st.markdown("#### Your logged offers")
+    if not mine:
+        st.caption("No offers logged yet.")
+    else:
+        rows = [{
+            "id": r.id,
+            "Date": (r.created_at or "")[:10],
+            "To": r.to_team,
+            "You send": ", ".join(r.sends),
+            "You receive": ", ".join(r.receives),
+            "Predicted": None if r.predicted_accept is None else round(r.predicted_accept, 1),
+            "Tier": r.tier or "",
+            "Status": STATUS_LABELS[r.status],
+            "Notes": r.notes,
+        } for r in mine]
+        edited = st.data_editor(
+            rows, hide_index=True, width="stretch", key=f"history_{league.league_id}",
+            disabled=["id", "Date", "To", "You send", "You receive", "Predicted", "Tier"],
+            column_config={
+                "id": None,
+                "Status": st.column_config.SelectboxColumn(options=[STATUS_LABELS[s] for s in STATUSES], required=True),
+                "Predicted": st.column_config.NumberColumn(help="The model's acceptance score for them when you logged it"),
+            },
+        )
+        label_to_status = {v: k for k, v in STATUS_LABELS.items()}
+        changes = [(new, old) for new, old in zip(edited, rows)
+                   if new["Status"] != old["Status"] or (new["Notes"] or "") != (old["Notes"] or "")]
+        if changes and st.button(f"Save {len(changes)} change{'s' if len(changes) != 1 else ''}", type="primary"):
+            try:
+                for new, _ in changes:
+                    store.update(new["id"], status=label_to_status[new["Status"]], notes=new["Notes"] or None)
+            except Exception as e:
+                st.error(f"Could not save: {e}")
+            else:
+                cached_history.clear()
+                st.toast("History updated")
+                st.rerun()
+
+    # ---- the league's completed trades
+    st.markdown("#### Trades completed in the league")
+    if not completed:
+        st.caption("No completed trades found on ESPN this season.")
+    else:
+        table([{
+            "Date": (r.created_at or "")[:10],
+            "Team A": r.from_team,
+            "A sends": ", ".join(r.sends),
+            "Team B": r.to_team,
+            "B sends": ", ".join(r.receives),
+        } for r in completed])
+    if summary.by_manager:
+        with st.expander("By manager"):
+            table(summary.by_manager)
 
 
 def main():
@@ -581,6 +793,8 @@ def main():
         waiver_page(league_manager, analyzer, league_name, team_id)
     elif page == "Trade Finder":
         trade_finder_page(league_manager, league_name, team_id)
+    elif page == "Trade History":
+        trade_history_page(league_manager, league_name)
     elif page == "Standings":
         standings_page(league_manager, analyzer, league_name)
 
